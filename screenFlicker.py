@@ -20,21 +20,16 @@ Two flicker scheduling modes are supported:
 
   This creates a 50 % duty-cycle square wave at *any* target frequency
   up to half the refresh rate by interleaving slightly different period
-  lengths. The paper demonstrated that SSVEPs elicited this way are
-  statistically comparable to those from the constant-period approach,
-  and validated it for 8–15 Hz in an eight-target BCI with a 75 Hz display.
+  lengths.
 
   FlickerMode.FRAME_COUNT  (precise — limited to a discrete set of frequencies)
   ──────────────────────────────────────────────────────────────────────────────
   The conventional constant-period approach. Each half-period is a fixed
   integer number of frames:
       frames_per_half = round(refresh_rate / (2 * target_freq))
-  The stimulus is ON for that many frames, then OFF for the same count.
-  The *actual* flicker frequency will be:
+  The actual delivered frequency is:
       actual_freq = refresh_rate / (2 * frames_per_half)
-  which may differ from the requested frequency unless refresh_rate is
-  evenly divisible by (2 * target_freq). A warning is printed at startup
-  if the deviation exceeds 1 %.
+  A warning is printed at startup if the deviation exceeds 1 %.
 
 Usage
 ─────
@@ -50,13 +45,92 @@ import pygame
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Flicker mode
+# Enumerations
 # ──────────────────────────────────────────────────────────────────────────────
 
 class FlickerMode(enum.Enum):
     """Selects the frame-scheduling algorithm for a Stimulus."""
-    APPROXIMATION = "approximation"   # Nakanishi et al. (2014) — flexible freq
-    FRAME_COUNT   = "frame_count"     # Classic constant-period — exact frames
+    APPROXIMATION = "Approx"      # Nakanishi et al. (2014) — flexible freq
+    FRAME_COUNT   = "Frame"       # Classic constant-period — exact frames
+
+
+class FlickerType(enum.Enum):
+    """Selects what is shown during the OFF half-cycle."""
+    ON_OFF      = "On/Off"        # Alternates between image and blank (black)
+    ON_NEGATIVE = "On/Negative"   # Alternates between image and its colour negative
+
+
+class ColorMode(enum.Enum):
+    """Selects whether the image is rendered in full colour or greyscale."""
+    COLOUR     = "Colour"
+    GREYSCALE  = "Greyscale"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Image processing helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _to_greyscale(surf: pygame.Surface) -> pygame.Surface:
+    """
+    Return a greyscale copy of *surf*, preserving per-pixel alpha.
+
+    Luminance is computed using the ITU-R BT.601 coefficients:
+        L = 0.299·R + 0.587·G + 0.114·B
+
+    Uses numpy (via pygame.surfarray) when available for speed; falls back to
+    a pure-pygame pixel loop otherwise.
+    """
+    w, h = surf.get_size()
+    out  = pygame.Surface((w, h), pygame.SRCALPHA)
+
+    try:
+        import numpy as np
+        rgb = pygame.surfarray.array3d(surf)          # shape (w, h, 3), uint8
+        lum = (0.299 * rgb[:, :, 0] +
+               0.587 * rgb[:, :, 1] +
+               0.114 * rgb[:, :, 2]).astype(np.uint8)
+        grey_rgb        = np.stack([lum, lum, lum], axis=2)
+        pygame.surfarray.blit_array(out, grey_rgb)
+        # Copy original alpha channel
+        alpha = pygame.surfarray.array_alpha(surf)    # shape (w, h), uint8
+        pygame.surfarray.pixels_alpha(out)[:] = alpha
+
+    except ImportError:
+        for x in range(w):
+            for y in range(h):
+                r, g, b, a = surf.get_at((x, y))
+                lum = int(0.299 * r + 0.587 * g + 0.114 * b)
+                out.set_at((x, y), (lum, lum, lum, a))
+
+    return out
+
+
+def _to_negative(surf: pygame.Surface) -> pygame.Surface:
+    """
+    Return a colour-negative copy of *surf* (RGB channels inverted,
+    alpha channel preserved).
+
+    Uses numpy (via pygame.surfarray) when available for speed; falls back to
+    a pure-pygame pixel loop otherwise.
+    """
+    w, h = surf.get_size()
+    out  = pygame.Surface((w, h), pygame.SRCALPHA)
+
+    try:
+        import numpy as np
+        rgb = pygame.surfarray.array3d(surf)           # shape (w, h, 3), uint8
+        inv_rgb = (255 - rgb).astype("uint8")
+        pygame.surfarray.blit_array(out, inv_rgb)
+        alpha = pygame.surfarray.array_alpha(surf)
+        pygame.surfarray.pixels_alpha(out)[:] = alpha
+
+    except ImportError:
+        for x in range(w):
+            for y in range(h):
+                r, g, b, a = surf.get_at((x, y))
+                out.set_at((x, y), (255 - r, 255 - g, 255 - b, a))
+
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -69,17 +143,23 @@ class Stimulus:
 
     Parameters
     ----------
-    image_path  : str
+    image_path   : str
         Path to an image file (PNG, JPG, BMP, …).
-    position    : (int, int)
+    position     : (int, int)
         (x, y) centre of the image on screen, in pixels.
-    size        : (int, int) | None
+    size         : (int, int) | None
         (width, height) to scale the image to.  None keeps the original size.
-    target_freq : float
+    target_freq  : float
         Desired flicker frequency in Hz.
-    mode        : FlickerMode
-        APPROXIMATION (default) or FRAME_COUNT — see module docstring.
-    phase       : float
+    flicker_mode : FlickerMode
+        APPROXIMATION (default) or FRAME_COUNT — controls frame scheduling.
+    flicker_type : FlickerType
+        ON_OFF (default) — alternates between image and black.
+        ON_NEGATIVE      — alternates between image and its colour negative.
+    color_mode   : ColorMode
+        COLOUR (default) — display image as loaded.
+        GREYSCALE        — convert image to greyscale before display.
+    phase        : float
         Initial phase offset in [0.0, 1.0).  0.5 starts in the OFF half-cycle.
         Useful for phase-coded SSVEP paradigms.
         Only applied in APPROXIMATION mode; ignored in FRAME_COUNT mode.
@@ -91,27 +171,36 @@ class Stimulus:
         position: tuple,
         size: tuple = None,
         target_freq: float = 1.0,
-        mode: FlickerMode = FlickerMode.APPROXIMATION,
+        flicker_mode: FlickerMode = FlickerMode.APPROXIMATION,
+        flicker_type: FlickerType = FlickerType.ON_OFF,
+        color_mode: ColorMode = ColorMode.COLOUR,
         phase: float = 0.0,
     ):
-        self.position    = position
-        self.target_freq = target_freq
-        self.mode        = mode
-        self.phase       = phase % 1.0
+        self.position     = position
+        self.target_freq  = target_freq
+        self.flicker_mode = flicker_mode
+        self.flicker_type = flicker_type
+        self.color_mode   = color_mode
+        self.phase        = phase % 1.0
 
-        # Load and optionally resize the image
+        # ── load and process image ───────────────────────────────────────────
         raw = pygame.image.load(image_path).convert_alpha()
         if size is not None:
             raw = pygame.transform.smoothscale(raw, size)
-        self.image = raw
-        self.rect  = self.image.get_rect(center=position)
 
-        # Frame counter — incremented once per display frame
+        if color_mode is ColorMode.GREYSCALE:
+            raw = _to_greyscale(raw)
+
+        self._image_on  = raw
+        self._image_off = _to_negative(raw) if flicker_type is FlickerType.ON_NEGATIVE else None
+        self.rect       = self._image_on.get_rect(center=position)
+
+        # ── frame counter (incremented once per display frame) ───────────────
         self._frame: int = 0
 
-        # Populated by _configure() before the loop starts
-        self._refresh_rate: float = 60.0
-        self._frames_per_half: int = 1   # FRAME_COUNT mode only
+        # ── populated by _configure() before the render loop ────────────────
+        self._refresh_rate:    float = 60.0
+        self._frames_per_half: int   = 1     # FRAME_COUNT mode only
 
     # ── called once by StimulusDisplay after the pygame window is open ──────
 
@@ -119,33 +208,30 @@ class Stimulus:
         """Derive scheduling parameters from the actual display refresh rate."""
         self._refresh_rate = refresh_rate
 
-        if self.mode is FlickerMode.FRAME_COUNT:
+        if self.flicker_mode is FlickerMode.FRAME_COUNT:
             self._frames_per_half = max(1, round(refresh_rate / (2.0 * self.target_freq)))
             actual    = refresh_rate / (2.0 * self._frames_per_half)
             deviation = abs(actual - self.target_freq) / self.target_freq
             if deviation > 0.01:
-                print(
-                    f"  [WARNING] Stimulus @ {self.position}  FRAME_COUNT: "
-                    f"requested {self.target_freq:.3f} Hz → "
+                return (
+                    f"FRAME_COUNT: requested {self.target_freq:.3f} Hz → "
                     f"actual {actual:.3f} Hz "
-                    f"({deviation*100:.1f} % deviation). "
-                    f"Consider FlickerMode.APPROXIMATION for this frequency."
+                    f"({deviation * 100:.1f}% deviation). "
+                    f"Consider FlickerMode.APPROXIMATION."
                 )
+        return None  # no warning
 
-    # ── per-frame state ──────────────────────────────────────────────────────
+    # ── per-frame ON/OFF state ───────────────────────────────────────────────
 
     @property
-    def visible(self) -> bool:
-        """True when the stimulus should be drawn on the current frame."""
-        if self.mode is FlickerMode.APPROXIMATION:
+    def _on_phase(self) -> bool:
+        """True during the ON half-cycle of the current frame."""
+        if self.flicker_mode is FlickerMode.APPROXIMATION:
             # Nakanishi et al. (2014), Eq. (1) extended with initial phase φ:
             #   s[i] = square( i·f/fs + φ )
-            # The 50 % duty-cycle square wave is ON when its fractional argument
-            # lies in [0, 0.5).
             t = (self._frame * self.target_freq / self._refresh_rate + self.phase) % 1.0
             return t < 0.5
         else:
-            # FRAME_COUNT: constant integer half-period length.
             return (self._frame % (2 * self._frames_per_half)) < self._frames_per_half
 
     def update(self) -> None:
@@ -153,21 +239,28 @@ class Stimulus:
         self._frame += 1
 
     def draw(self, surface: pygame.Surface) -> None:
-        """Blit the image onto *surface* when in the ON phase."""
-        if self.visible:
-            surface.blit(self.image, self.rect)
+        """
+        Blit the appropriate image onto *surface* for the current frame.
 
-    # ── convenience ─────────────────────────────────────────────────────────
+        ON phase  → draws the (possibly greyscale) stimulus image.
+        OFF phase → draws nothing (ON_OFF) or the colour negative (ON_NEGATIVE).
+        """
+        if self._on_phase:
+            surface.blit(self._image_on, self.rect)
+        elif self._image_off is not None:
+            surface.blit(self._image_off, self.rect)
+
+    # ── convenience property ─────────────────────────────────────────────────
 
     @property
     def actual_freq(self) -> float:
         """
         The true flicker frequency delivered to the display.
 
-        APPROXIMATION mode: equals target_freq (floating-point precision).
-        FRAME_COUNT mode  : quantised to the nearest achievable frequency.
+        APPROXIMATION: equals target_freq exactly.
+        FRAME_COUNT  : quantised to the nearest achievable frequency.
         """
-        if self.mode is FlickerMode.APPROXIMATION:
+        if self.flicker_mode is FlickerMode.APPROXIMATION:
             return self.target_freq
         return self._refresh_rate / (2.0 * self._frames_per_half)
 
@@ -187,8 +280,7 @@ class StimulusDisplay:
     fullscreen : bool
         Run in fullscreen (True) or in a 1280×720 window (False).
     fps        : int
-        Target refresh rate in Hz.  Set this to your monitor's native refresh
-        rate for accurate flicker timing (e.g. 60, 75, 120, 144).
+        Target refresh rate in Hz.  Should match the monitor's native rate.
     bg_color   : (int, int, int)
         RGB background colour (default black).
     """
@@ -205,15 +297,128 @@ class StimulusDisplay:
         self.bg_color   = bg_color
         self.fullscreen = fullscreen
 
+    # ── print helpers ────────────────────────────────────────────────────────
+
+    def _print_startup(self, refresh_rate: float, warnings: list) -> None:
+        """Print a formatted, auto-sizing configuration table to stdout."""
+
+        SEP = "  "   # column separator (two spaces)
+        PAD = 2      # inner left/right padding inside the box borders
+
+        # ── build table cell data ────────────────────────────────────────────
+        headers = [
+            "#", "Position", "Sched. Mode",
+            "Target (Hz)", "Actual (Hz)", "Flicker", "Colour", "Phase",
+        ]
+        rows = [
+            [
+                str(i),
+                str(s.position),
+                s.flicker_mode.value,
+                f"{s.target_freq:.4f}",
+                f"{s.actual_freq:.4f}",
+                s.flicker_type.value,
+                s.color_mode.value,
+                f"{s.phase:.3f}",
+            ]
+            for i, s in enumerate(self.stimuli, 1)
+        ]
+
+        # ── compute column widths from actual content ────────────────────────
+        col_w = [len(h) for h in headers]
+        for row in rows:
+            for j, cell in enumerate(row):
+                col_w[j] = max(col_w[j], len(cell))
+
+        def fmt_row(cells: list) -> str:
+            """Format a list of cells into a fixed-width column string."""
+            return SEP.join(cell.ljust(col_w[j]) for j, cell in enumerate(cells))
+
+        # ── determine box inner width ────────────────────────────────────────
+        # Must accommodate: table rows, info lines, and the title
+        info_lines = [
+            ("Display refresh rate",  f"{refresh_rate:.1f} Hz"),
+            ("Background colour (RGB)", str(self.bg_color)),
+            ("Fullscreen",            str(self.fullscreen)),
+        ]
+        info_label_w = max(len(label) for label, _ in info_lines)
+        info_strs    = [f"{lbl:<{info_label_w}}  {val}" for lbl, val in info_lines]
+
+        table_row_w = len(fmt_row(headers))
+        title       = "Blinking Stimuli — Configuration"
+
+        inner_w = max(
+            len(title),
+            table_row_w,
+            max(len(s) for s in info_strs),
+        )
+
+        # ── box drawing helpers ──────────────────────────────────────────────
+        total_w = inner_w + PAD * 2   # total width between the │ borders
+
+        def hline(left: str, fill: str, right: str) -> str:
+            return left + fill * total_w + right
+
+        def bline(content: str, align: str = "<") -> str:
+            """A single bordered line, content padded to inner_w."""
+            padded = f"{content:{align}{inner_w}}"
+            return f"│{' ' * PAD}{padded}{' ' * PAD}│"
+
+        def divider_line() -> str:
+            return f"│{' ' * PAD}{'─' * inner_w}{' ' * PAD}│"
+
+        # ── print ────────────────────────────────────────────────────────────
+        print()
+        print(hline("┌", "─", "┐"))
+        print(bline(title, "^"))
+        print(hline("├", "─", "┤"))
+        for s in info_strs:
+            print(bline(s))
+        print(hline("├", "─", "┤"))
+        print(bline(fmt_row(headers)))
+        print(divider_line())
+        for row in rows:
+            print(bline(fmt_row(row)))
+
+        if warnings:
+            print(hline("├", "─", "┤"))
+            print(bline("Warnings", "^"))
+            print(divider_line())
+            prefix_w  = max(len(f"Stimulus {idx}: ") for idx, _ in warnings)
+            wrap_w    = inner_w - prefix_w
+            for idx, msg in warnings:
+                prefix = f"Stimulus {idx}: ".ljust(prefix_w)
+                indent = " " * prefix_w
+                # word-wrap the message to fit within the box
+                words, out_lines, line = msg.split(), [], ""
+                for word in words:
+                    candidate = (line + " " + word).strip()
+                    if len(candidate) <= wrap_w:
+                        line = candidate
+                    else:
+                        if line:
+                            out_lines.append(line)
+                        line = word
+                if line:
+                    out_lines.append(line)
+                for k, ln in enumerate(out_lines):
+                    print(bline((prefix if k == 0 else indent) + ln))
+
+        print(hline("└", "─", "┘"))
+        print()
+
+    # ── main loop ────────────────────────────────────────────────────────────
+
     def run(self) -> None:
-        """Enter the main event loop.  Escape or close the window to quit."""
+        """Open the display, configure stimuli, and enter the render loop."""
         pygame.init()
 
-        # Reuse an existing surface (opened before stimuli were built) or
-        # create a new one.
+        # Reuse an existing surface (opened before stimuli were built) or create
+        # a new one.
         screen = pygame.display.get_surface()
         if screen is None:
-            flags = pygame.FULLSCREEN | pygame.HWSURFACE | pygame.DOUBLEBUF if self.fullscreen else 0
+            flags = (pygame.FULLSCREEN | pygame.HWSURFACE | pygame.DOUBLEBUF
+                     if self.fullscreen else 0)
             if self.fullscreen:
                 screen = pygame.display.set_mode((0, 0), flags)
             else:
@@ -231,17 +436,14 @@ class StimulusDisplay:
         except AttributeError:
             pass
 
-        print(f"\n[StimulusDisplay] Refresh rate: {refresh_rate:.1f} Hz")
-        for s in self.stimuli:
-            s._configure(refresh_rate)
-            print(
-                f"  Stimulus @ {s.position}  "
-                f"mode={s.mode.value:13s}  "
-                f"target={s.target_freq:.4f} Hz  "
-                f"actual={s.actual_freq:.4f} Hz  "
-                f"phase={s.phase:.3f}"
-            )
-        print()
+        # Configure each stimulus and collect any warnings
+        warnings = []
+        for i, s in enumerate(self.stimuli, 1):
+            msg = s._configure(refresh_rate)
+            if msg:
+                warnings.append((i, msg))
+
+        self._print_startup(refresh_rate, warnings)
 
         clock = pygame.time.Clock()
 
@@ -276,38 +478,37 @@ def _make_placeholder(color: tuple, label: str, size: int = 200) -> str:
     font = pygame.font.SysFont(None, max(20, size // 7))
     text = font.render(label, True, (255, 255, 255))
     surf.blit(text, text.get_rect(center=(size // 2, size // 2)))
-    path = os.path.join(tempfile.gettempdir(), f"ssvep_{label.replace(' ', '_')}.png")
+    path = os.path.join(tempfile.gettempdir(),
+                        f"ssvep_{label.replace(' ', '_')}.png")
     pygame.image.save(surf, path)
     return path
 
 
 def create_demo_stimuli(W: int, H: int) -> list:
     """
-    Eight demo stimuli mirroring the eight-target BCI in Nakanishi et al.
-    (2014): frequencies 8–15 Hz, four across the top and four across the bottom.
+    Eight demo stimuli: 4 across the top row and 4 across the bottom, covering
+    8–15 Hz.  Demonstrates all four combinations of FlickerType and ColorMode.
 
-    The top row uses FlickerMode.APPROXIMATION (handles all frequencies).
-    The bottom row uses FlickerMode.FRAME_COUNT (exact integer periods).
-    At 60 Hz the FRAME_COUNT stimuli deviate slightly from the target and
-    startup warnings are printed so you can see the difference.
+    Top-left pair    → APPROXIMATION + ON_OFF + COLOUR
+    Top-right pair   → APPROXIMATION + ON_OFF + GREYSCALE
+    Bottom-left pair → FRAME_COUNT   + ON_NEGATIVE + COLOUR
+    Bottom-right pair→ FRAME_COUNT   + ON_NEGATIVE + GREYSCALE
     """
     pygame.font.init()
 
-    # (color, short label, target Hz, mode, initial phase)
     specs = [
-        # ── top row: APPROXIMATION mode ──────────────────────────────────────
-        ((220,  60,  60), " 8 Hz\nApprox",  8.0, FlickerMode.APPROXIMATION, 0.00),
-        (( 60, 180,  60), " 9 Hz\nApprox",  9.0, FlickerMode.APPROXIMATION, 0.00),
-        (( 60, 120, 220), "10 Hz\nApprox", 10.0, FlickerMode.APPROXIMATION, 0.00),
-        ((200, 160,  40), "11 Hz\nApprox", 11.0, FlickerMode.APPROXIMATION, 0.00),
-        # ── bottom row: FRAME_COUNT mode ─────────────────────────────────────
-        ((160,  60, 210), "12 Hz\nFrame",  12.0, FlickerMode.FRAME_COUNT,   0.00),
-        (( 40, 200, 190), "13 Hz\nFrame",  13.0, FlickerMode.FRAME_COUNT,   0.00),
-        ((220, 120,  40), "14 Hz\nFrame",  14.0, FlickerMode.FRAME_COUNT,   0.00),
-        ((200, 200, 200), "15 Hz\nFrame",  15.0, FlickerMode.FRAME_COUNT,   0.00),
+        #  color              label     Hz    sched mode               flicker type            color mode
+        ((220,  60,  60), " 8 Hz",   8.0, FlickerMode.APPROXIMATION, FlickerType.ON_OFF,      ColorMode.COLOUR),
+        (( 60, 180,  60), " 9 Hz",   9.0, FlickerMode.APPROXIMATION, FlickerType.ON_OFF,      ColorMode.GREYSCALE),
+        (( 60, 120, 220), "10 Hz",  10.0, FlickerMode.APPROXIMATION, FlickerType.ON_NEGATIVE, ColorMode.COLOUR),
+        ((200, 160,  40), "11 Hz",  11.0, FlickerMode.APPROXIMATION, FlickerType.ON_NEGATIVE, ColorMode.GREYSCALE),
+        ((160,  60, 210), "12 Hz",  12.0, FlickerMode.FRAME_COUNT,   FlickerType.ON_OFF,      ColorMode.COLOUR),
+        (( 40, 200, 190), "13 Hz",  13.0, FlickerMode.FRAME_COUNT,   FlickerType.ON_OFF,      ColorMode.GREYSCALE),
+        ((220, 120,  40), "14 Hz",  14.0, FlickerMode.FRAME_COUNT,   FlickerType.ON_NEGATIVE, ColorMode.COLOUR),
+        ((200, 200, 200), "15 Hz",  15.0, FlickerMode.FRAME_COUNT,   FlickerType.ON_NEGATIVE, ColorMode.GREYSCALE),
     ]
 
-    paths = [_make_placeholder(c, lbl.replace("\n", " ")) for c, lbl, *_ in specs]
+    paths = [_make_placeholder(c, lbl) for c, lbl, *_ in specs]
 
     positions = [
         (W * 1 // 5, H // 4), (W * 2 // 5, H // 4),
@@ -318,12 +519,13 @@ def create_demo_stimuli(W: int, H: int) -> list:
 
     return [
         Stimulus(
-            image_path="./Images/WhiteSquare1.png",
-            position=positions[i],
-            size=(160, 160),
-            target_freq=specs[i][2],
-            mode=specs[i][3],
-            phase=specs[i][4],
+            image_path   = paths[i],
+            position     = positions[i],
+            size         = (160, 160),
+            target_freq  = specs[i][2],
+            flicker_mode = specs[i][3],
+            flicker_type = specs[i][4],
+            color_mode   = specs[i][5],
         )
         for i in range(8)
     ]
@@ -336,44 +538,36 @@ def create_demo_stimuli(W: int, H: int) -> list:
 if __name__ == "__main__":
     # ─── CONFIGURE YOUR EXPERIMENT HERE ──────────────────────────────────────
     #
-    # Build your stimulus list and pass it to StimulusDisplay, e.g.:
+    # Build your STIMULI list and pass it to StimulusDisplay, e.g.:
     #
     #   STIMULI = [
     #       Stimulus(
-    #           image_path = "checkerboard.png",
-    #           position   = (W // 2, H // 2),
-    #           size       = (200, 200),
-    #           target_freq= 10.0,
-    #           mode       = FlickerMode.APPROXIMATION,
-    #           phase      = 0.0,    # 0.0 = starts ON; 0.5 = starts OFF
-    #       ),
-    #       Stimulus(
-    #           image_path = "face.png",
-    #           position   = (W // 4, H // 2),
-    #           size       = (150, 150),
-    #           target_freq= 12.0,
-    #           mode       = FlickerMode.FRAME_COUNT,
-    #           # phase is ignored in FRAME_COUNT mode
+    #           image_path   = "checkerboard.png",
+    #           position     = (W // 2, H // 2),
+    #           size         = (200, 200),
+    #           target_freq  = 10.0,
+    #           flicker_mode = FlickerMode.APPROXIMATION,
+    #           flicker_type = FlickerType.ON_NEGATIVE,
+    #           color_mode   = ColorMode.GREYSCALE,
+    #           phase        = 0.0,
     #       ),
     #   ]
     #
     # ─── FREQUENCY GUIDANCE ──────────────────────────────────────────────────
     #
-    # APPROXIMATION: any target_freq < refresh_rate / 2 works exactly.
-    #
-    # FRAME_COUNT:   only frequencies where refresh_rate / (2 * f) is an
-    # integer are exact.  At 60 Hz these are 30, 15, 12, 10, 7.5, 6, 5, …
-    # A startup warning is printed when deviation > 1 %.
+    # APPROXIMATION: any target_freq < refresh_rate / 2 is valid.
+    # FRAME_COUNT:   exact only when refresh_rate / (2 * target_freq) is an
+    #                integer. A warning is printed if deviation > 1 %.
     #
     # ─────────────────────────────────────────────────────────────────────────
 
-    TARGET_FPS  = 60    # set to your monitor's native refresh rate
-    FULLSCREEN  = True  # False for a 1280×720 windowed mode
+    TARGET_FPS = 60    # set to your monitor's native refresh rate
+    FULLSCREEN = True  # False for a 1280×720 windowed mode
 
     pygame.init()
 
-    # Open the display FIRST so display.Info() returns the real screen size,
-    # which we need to position stimuli across the full screen.
+    # Open the display FIRST so pygame.display.Info() returns the real screen
+    # dimensions, which are needed to position stimuli correctly.
     flags = pygame.FULLSCREEN | pygame.HWSURFACE | pygame.DOUBLEBUF if FULLSCREEN else 0
     if FULLSCREEN:
         pygame.display.set_mode((0, 0), flags)
@@ -386,8 +580,8 @@ if __name__ == "__main__":
     STIMULI = create_demo_stimuli(W, H)
 
     StimulusDisplay(
-        stimuli   = STIMULI,
-        fullscreen= FULLSCREEN,
-        fps       = TARGET_FPS,
-        bg_color  = (0, 0, 0),
+        stimuli    = STIMULI,
+        fullscreen = FULLSCREEN,
+        fps        = TARGET_FPS,
+        bg_color   = (0, 0, 0),
     ).run()
