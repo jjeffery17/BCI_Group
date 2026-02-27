@@ -40,6 +40,7 @@ Usage
 """
 
 import sys
+import math
 import enum
 import pygame
 
@@ -467,6 +468,297 @@ class StimulusDisplay:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Quick layout factory
+# ──────────────────────────────────────────────────────────────────────────────
+
+class QuickLayout:
+    """
+    Factory class for generating Stimulus lists in common spatial arrangements.
+
+    All methods return a ``list[Stimulus]`` that can be passed directly to
+    ``StimulusDisplay``.
+
+    Per-stimulus parameters (``image_paths``, ``target_freq``, ``phase``) accept
+    either a single value (applied to every stimulus) or a list.  If a list is
+    shorter than the number of stimuli it is cycled via modular indexing.
+
+    Layout methods
+    ──────────────
+    grid          Regular rows × cols rectangular grid.
+    circle        N stimuli equally spaced around a circle.
+    checkerboard  Rows × cols grid with two interleaved groups (A/B) occupying
+                  alternate cells in a checkerboard pattern.
+    """
+
+    # ── internal helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _get(val, i: int):
+        """Return val[i % len(val)] for lists, or val for scalars."""
+        if isinstance(val, (list, tuple)):
+            return val[i % len(val)]
+        return val
+
+    @staticmethod
+    def _make(image_paths, positions, size, target_freqs, phases,
+              flicker_mode, flicker_type, color_mode) -> list:
+        """Construct a Stimulus for each position with broadcast parameters."""
+        stimuli = []
+        for i, pos in enumerate(positions):
+            stimuli.append(Stimulus(
+                image_path   = QuickLayout._get(image_paths,  i),
+                position     = pos,
+                size         = size,
+                target_freq  = QuickLayout._get(target_freqs, i),
+                flicker_mode = QuickLayout._get(flicker_mode, i),
+                flicker_type = QuickLayout._get(flicker_type, i),
+                color_mode   = QuickLayout._get(color_mode,   i),
+                phase        = QuickLayout._get(phases,       i),
+            ))
+        return stimuli
+
+    # ── grid ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def grid(
+        image_paths,
+        W: int,
+        H: int,
+        rows: int,
+        cols: int,
+        size: tuple              = (150, 150),
+        target_freq              = 10.0,
+        margin: float            = 0.10,
+        flicker_mode             = FlickerMode.FRAME_COUNT,
+        flicker_type             = FlickerType.ON_OFF,
+        color_mode               = ColorMode.COLOUR,
+        phase                    = 0.0,
+    ) -> list:
+        """
+        Arrange stimuli in a regular *rows* × *cols* rectangular grid.
+
+        Parameters
+        ----------
+        image_paths : str or list[str]
+            Image path(s).  Cycled across all positions if a list.
+        W, H        : int
+            Screen width and height in pixels.
+        rows, cols  : int
+            Number of rows and columns.
+        size        : (int, int)
+            Stimulus display size in pixels.
+        target_freq : float or list[float]
+            Flicker frequency in Hz.  Cycled if a list.
+        margin      : float
+            Fractional margin reserved on each edge of the screen (0.0–0.5).
+            E.g. 0.10 leaves 10 % of the screen width/height as a border.
+        flicker_mode, flicker_type, color_mode, phase
+            Passed directly to each ``Stimulus``.  All accept a scalar
+            (shared by every stimulus) or a list (cycled).
+
+        Returns
+        -------
+        list[Stimulus]
+            Stimuli ordered left-to-right, top-to-bottom.
+
+        Example
+        -------
+        >>> stimuli = QuickLayout.grid(
+        ...     "target.png", W, H, rows=2, cols=4,
+        ...     target_freq=[8, 9, 10, 11, 12, 13, 14, 15],
+        ... )
+        """
+        x0       = W * margin
+        y0       = H * margin
+        cell_w   = W * (1 - 2 * margin) / cols
+        cell_h   = H * (1 - 2 * margin) / rows
+        positions = [
+            (int(x0 + (c + 0.5) * cell_w),
+             int(y0 + (r + 0.5) * cell_h))
+            for r in range(rows)
+            for c in range(cols)
+        ]
+        return QuickLayout._make(image_paths, positions, size,
+                                 target_freq, phase,
+                                 flicker_mode, flicker_type, color_mode)
+
+    # ── circle ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def circle(
+        image_paths,
+        W: int,
+        H: int,
+        n: int,
+        radius: float            = 0.35,
+        center: tuple            = None,
+        start_angle: float       = 90.0,
+        size: tuple              = (150, 150),
+        target_freq              = 10.0,
+        flicker_mode             = FlickerMode.FRAME_COUNT,
+        flicker_type             = FlickerType.ON_OFF,
+        color_mode               = ColorMode.COLOUR,
+        phase                    = 0.0,
+    ) -> list:
+        """
+        Arrange *n* stimuli equally spaced around a circle.
+
+        Parameters
+        ----------
+        image_paths  : str or list[str]
+            Image path(s).  Cycled across all positions if a list.
+        W, H         : int
+            Screen width and height in pixels.
+        n            : int
+            Number of stimuli.
+        radius       : float
+            Circle radius as a fraction of ``min(W, H) / 2``.
+            E.g. 0.35 places stimuli at 35 % of the half-screen dimension.
+        center       : (int, int) or None
+            Pixel coordinates of the circle centre.  Defaults to the screen
+            centre ``(W // 2, H // 2)``.
+        start_angle  : float
+            Angle in degrees at which the first stimulus is placed.
+            90° = top (12 o'clock).  Stimuli are placed clockwise.
+        target_freq  : float or list[float]
+            Flicker frequency in Hz.  Cycled if a list.
+        flicker_mode, flicker_type, color_mode, phase
+            Passed directly to each ``Stimulus``.  All accept a scalar
+            or a list (cycled).
+
+        Returns
+        -------
+        list[Stimulus]
+            Stimuli ordered clockwise from *start_angle*.
+
+        Example
+        -------
+        >>> stimuli = QuickLayout.circle(
+        ...     "target.png", W, H, n=6,
+        ...     target_freq=[8, 9, 10, 11, 12, 13],
+        ... )
+        """
+        cx, cy = center if center is not None else (W // 2, H // 2)
+        r      = radius * min(W, H) / 2
+        positions = []
+        for i in range(n):
+            # Clockwise from start_angle; subtract because y increases downward.
+            angle_rad = math.radians(start_angle - i * 360.0 / n)
+            positions.append((
+                int(cx + r * math.cos(angle_rad)),
+                int(cy - r * math.sin(angle_rad)),
+            ))
+        return QuickLayout._make(image_paths, positions, size,
+                                 target_freq, phase,
+                                 flicker_mode, flicker_type, color_mode)
+
+    # ── checkerboard ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def checkerboard(
+        image_paths_a,
+        image_paths_b,
+        W: int,
+        H: int,
+        rows: int,
+        cols: int,
+        size: tuple              = (150, 150),
+        target_freq_a            = 10.0,
+        target_freq_b            = 12.0,
+        margin: float            = 0.10,
+        flicker_mode             = FlickerMode.FRAME_COUNT,
+        flicker_type             = FlickerType.ON_OFF,
+        color_mode               = ColorMode.COLOUR,
+        phase_a                  = 0.0,
+        phase_b                  = 0.0,
+    ) -> list:
+        """
+        Arrange stimuli in a *rows* × *cols* grid where cells alternate between
+        two groups (A and B) in a checkerboard pattern:
+
+            A B A B
+            B A B A
+            A B A B
+
+        Group A occupies cells where ``(row + col) % 2 == 0``;
+        group B occupies cells where ``(row + col) % 2 == 1``.
+
+        This is particularly useful for SSVEP paradigms where two interleaved
+        sets of targets flicker at different frequencies.
+
+        Parameters
+        ----------
+        image_paths_a, image_paths_b : str or list[str]
+            Image path(s) for group A and group B respectively.
+        W, H          : int
+            Screen width and height in pixels.
+        rows, cols    : int
+            Grid dimensions.
+        size          : (int, int)
+            Stimulus display size in pixels.
+        target_freq_a, target_freq_b : float or list[float]
+            Flicker frequencies for each group.  Cycled within each group
+            if lists are provided.
+        margin        : float
+            Fractional screen margin on each edge (0.0–0.5).
+        flicker_mode, flicker_type, color_mode
+            Shared stimulus parameters applied to all stimuli.
+        phase_a, phase_b : float or list[float]
+            Phase offsets for group A and group B.
+
+        Returns
+        -------
+        list[Stimulus]
+            Stimuli ordered left-to-right, top-to-bottom, with A/B
+            assignment determined by the checkerboard pattern.
+
+        Example
+        -------
+        >>> stimuli = QuickLayout.checkerboard(
+        ...     "face.png", "house.png", W, H, rows=3, cols=4,
+        ...     target_freq_a=10.0, target_freq_b=12.0,
+        ... )
+        """
+        x0      = W * margin
+        y0      = H * margin
+        cell_w  = W * (1 - 2 * margin) / cols
+        cell_h  = H * (1 - 2 * margin) / rows
+
+        idx_a = idx_b = 0
+        stimuli = []
+
+        for r in range(rows):
+            for c in range(cols):
+                pos   = (int(x0 + (c + 0.5) * cell_w),
+                         int(y0 + (r + 0.5) * cell_h))
+                group = (r + c) % 2  # 0 → A, 1 → B
+
+                if group == 0:
+                    img   = QuickLayout._get(image_paths_a, idx_a)
+                    freq  = QuickLayout._get(target_freq_a, idx_a)
+                    ph    = QuickLayout._get(phase_a,       idx_a)
+                    idx_a += 1
+                else:
+                    img   = QuickLayout._get(image_paths_b, idx_b)
+                    freq  = QuickLayout._get(target_freq_b, idx_b)
+                    ph    = QuickLayout._get(phase_b,       idx_b)
+                    idx_b += 1
+
+                stimuli.append(Stimulus(
+                    image_path   = img,
+                    position     = pos,
+                    size         = size,
+                    target_freq  = freq,
+                    flicker_mode = QuickLayout._get(flicker_mode, len(stimuli)),
+                    flicker_type = QuickLayout._get(flicker_type, len(stimuli)),
+                    color_mode   = QuickLayout._get(color_mode,   len(stimuli)),
+                    phase        = ph,
+                ))
+
+        return stimuli
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Demo helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -538,13 +830,13 @@ def create_demo_stimuli(W: int, H: int) -> list:
 if __name__ == "__main__":
     # ─── CONFIGURE YOUR EXPERIMENT HERE ──────────────────────────────────────
     #
-    # Build your STIMULI list and pass it to StimulusDisplay, e.g.:
+    # Option A — manual stimulus list:
     #
     #   STIMULI = [
     #       Stimulus(
-    #           image_path   = "checkerboard.png",
+    #           image_path   = "target.png",
     #           position     = (W // 2, H // 2),
-    #           size         = (200, 200),
+    #           size         = (150, 150),
     #           target_freq  = 10.0,
     #           flicker_mode = FlickerMode.APPROXIMATION,
     #           flicker_type = FlickerType.ON_NEGATIVE,
@@ -552,6 +844,28 @@ if __name__ == "__main__":
     #           phase        = 0.0,
     #       ),
     #   ]
+    #
+    # Option B — QuickLayout factory (pick one):
+    #
+    #   # 2 × 4 grid, one frequency per cell
+    #   STIMULI = QuickLayout.grid(
+    #       "target.png", W, H, rows=2, cols=4,
+    #       target_freq=[8, 9, 10, 11, 12, 13, 14, 15],
+    #       flicker_type=FlickerType.ON_NEGATIVE,
+    #   )
+    #
+    #   # 8 stimuli equally spaced around a circle
+    #   STIMULI = QuickLayout.circle(
+    #       "target.png", W, H, n=8,
+    #       target_freq=[8, 9, 10, 11, 12, 13, 14, 15],
+    #       radius=0.38,
+    #   )
+    #
+    #   # 3 × 4 checkerboard — two interleaved groups at different frequencies
+    #   STIMULI = QuickLayout.checkerboard(
+    #       "face.png", "house.png", W, H, rows=3, cols=4,
+    #       target_freq_a=10.0, target_freq_b=12.0,
+    #   )
     #
     # ─── FREQUENCY GUIDANCE ──────────────────────────────────────────────────
     #
@@ -563,6 +877,11 @@ if __name__ == "__main__":
 
     TARGET_FPS = 60    # set to your monitor's native refresh rate
     FULLSCREEN = True  # False for a 1280×720 windowed mode
+
+    # ── DEMO: cycle through layout styles ────────────────────────────────────
+    # Change DEMO_LAYOUT to "grid", "circle", or "checkerboard" to preview
+    # each style using placeholder images.
+    DEMO_LAYOUT = "grid"
 
     pygame.init()
 
@@ -577,7 +896,57 @@ if __name__ == "__main__":
     info = pygame.display.Info()
     W, H = info.current_w, info.current_h
 
-    STIMULI = create_demo_stimuli(W, H)
+    pygame.font.init()
+
+    # Build placeholder images for the demo
+    colours  = [(220,60,60),(60,180,60),(60,120,220),(200,160,40),
+                (160,60,210),(40,200,190),(220,120,40),(200,200,200)]
+    freqs_8  = [8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+    paths_8  = [_make_placeholder(colours[i], f"{freqs_8[i]:.0f} Hz")
+                for i in range(8)]
+    paths_a  = [_make_placeholder((220, 80, 80),  "A")]
+    paths_b  = [_make_placeholder((80, 120, 220), "B")]
+
+    if DEMO_LAYOUT == "grid":
+        # 2 × 4 grid, 8–15 Hz, approximation mode, on/negative flicker
+        STIMULI = QuickLayout.grid(
+            image_paths  = paths_8,
+            W=W, H=H,
+            rows=2, cols=4,
+            size         = (150, 150),
+            target_freq  = freqs_8,
+            flicker_type = FlickerType.ON_NEGATIVE,
+            color_mode   = ColorMode.COLOUR,
+        )
+
+    elif DEMO_LAYOUT == "circle":
+        # 8 stimuli in a circle, 8–15 Hz
+        STIMULI = QuickLayout.circle(
+            image_paths = paths_8,
+            W=W, H=H,
+            n           = 8,
+            radius      = 0.38,
+            start_angle = 90.0,
+            size        = (150, 150),
+            target_freq = freqs_8,
+            flicker_type= FlickerType.ON_NEGATIVE,
+        )
+
+    elif DEMO_LAYOUT == "checkerboard":
+        # 3 × 4 checkerboard — group A at 10 Hz, group B at 12 Hz
+        STIMULI = QuickLayout.checkerboard(
+            image_paths_a = paths_a,
+            image_paths_b = paths_b,
+            W=W, H=H,
+            rows=3, cols=4,
+            size          = (140, 140),
+            target_freq_a = 10.0,
+            target_freq_b = 12.0,
+            flicker_type  = FlickerType.ON_NEGATIVE,
+        )
+
+    else:
+        STIMULI = create_demo_stimuli(W, H)
 
     StimulusDisplay(
         stimuli    = STIMULI,

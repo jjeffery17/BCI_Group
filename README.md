@@ -19,7 +19,8 @@ A Python stimulus presentation tool for flickering image displays, designed for 
    - 5.3 [`ColorMode`](#53-colormode)
    - 5.4 [`Stimulus`](#54-stimulus)
    - 5.5 [`StimulusDisplay`](#55-stimulusdisplay)
-   - 5.6 [Image Processing Helpers](#56-image-processing-helpers)
+   - 5.6 [`QuickLayout`](#56-quicklayout)
+   - 5.7 [Image Processing Helpers](#57-image-processing-helpers)
 6. [Configuration and Usage](#6-configuration-and-usage)
 7. [Frequency Constraints by Refresh Rate](#7-frequency-constraints-by-refresh-rate)
 8. [Worked Examples](#8-worked-examples)
@@ -39,6 +40,8 @@ Each stimulus is configured independently along four dimensions:
 - **Flicker type** — what is shown during the OFF half-cycle: blank screen or colour negative (`FlickerType`)
 - **Colour mode** — whether the image is presented in full colour or greyscale (`ColorMode`)
 - **Frequency and phase** — the target frequency in Hz and an optional initial phase offset
+
+Stimuli can be defined individually via the `Stimulus` class, or generated automatically from common spatial arrangements using the `QuickLayout` factory class, which provides built-in grid, circle, and checkerboard layouts.
 
 All flicker scheduling is frame-synchronous; no wall-clock timers are used. This ensures the stimulus sequence is always integer-aligned to the display's vertical refresh cycle.
 
@@ -128,15 +131,22 @@ blinking_stimuli.py
 │   ├── draw()           Blits ON or OFF image to surface
 │   └── actual_freq      (property) True delivered frequency
 │
-└── StimulusDisplay      (application / event loop)
-    ├── __init__()       Stores stimuli list and display settings
-    ├── _print_startup() Renders formatted configuration table to stdout
-    └── run()            Opens window, configures stimuli, runs render loop
+├── StimulusDisplay      (application / event loop)
+│   ├── __init__()       Stores stimuli list and display settings
+│   ├── _print_startup() Renders auto-sizing configuration table to stdout
+│   └── run()            Opens window, configures stimuli, runs render loop
+│
+└── QuickLayout          (layout factory — returns list[Stimulus])
+    ├── grid()           Regular rows × cols rectangular grid
+    ├── circle()         N stimuli equally spaced around a circle
+    └── checkerboard()   rows × cols grid with two interleaved A/B groups
 ```
 
 Image processing is performed once at construction time: `_to_greyscale()` converts the loaded image if `ColorMode.GREYSCALE` is selected, and `_to_negative()` pre-computes the inverted surface if `FlickerType.ON_NEGATIVE` is selected. Both are stored as pygame Surfaces (`_image_on` and `_image_off`) so that no per-frame computation is required.
 
 The render loop follows the sequence: poll events → clear screen → draw all stimuli → flip display buffer → advance all frame counters. Updating frame counters *after* drawing ensures that frame 0 is the first frame actually shown, which is important for phase-accurate onset timing.
+
+`QuickLayout` methods are pure spatial helpers — they compute pixel positions and construct `Stimulus` objects, but have no interaction with the display or event loop. Their output is a plain `list[Stimulus]` that is passed directly to `StimulusDisplay`.
 
 ---
 
@@ -258,19 +268,140 @@ StimulusDisplay(
 
 ---
 
-### 5.6 Image Processing Helpers
+### 5.6 `QuickLayout`
 
-These module-level functions are called internally by `Stimulus.__init__()` but can also be used independently.
+Factory class for generating `Stimulus` lists in common spatial arrangements. All methods return a `list[Stimulus]` that can be passed directly to `StimulusDisplay`.
+
+Per-stimulus parameters (`image_paths`, `target_freq`, `phase`) accept either a **single scalar value** (applied identically to every stimulus) or a **list** (cycled via modular indexing if shorter than the total number of stimuli).
+
+---
+
+#### `QuickLayout.grid()`
+
+```python
+QuickLayout.grid(
+    image_paths,
+    W: int,
+    H: int,
+    rows: int,
+    cols: int,
+    size: tuple         = (150, 150),
+    target_freq         = 10.0,
+    margin: float       = 0.10,
+    flicker_mode        = FlickerMode.APPROXIMATION,
+    flicker_type        = FlickerType.ON_OFF,
+    color_mode          = ColorMode.COLOUR,
+    phase               = 0.0,
+) -> list[Stimulus]
+```
+
+Arranges stimuli in a regular `rows × cols` rectangular grid. Positions are computed as the centres of equal-area cells within the usable screen area (screen minus margins). Stimuli are ordered left-to-right, top-to-bottom.
+
+| Parameter | Description |
+|---|---|
+| `image_paths` | Image path(s). A single string is shared across all positions; a list is cycled. |
+| `W`, `H` | Screen width and height in pixels. |
+| `rows`, `cols` | Grid dimensions. |
+| `size` | Stimulus display size `(width, height)` in pixels. |
+| `target_freq` | Flicker frequency in Hz. Scalar or list (cycled). |
+| `margin` | Fractional screen margin reserved on each edge (0.0–0.5). E.g. `0.10` leaves a 10% border. |
+| `flicker_mode`, `flicker_type`, `color_mode`, `phase` | Stimulus parameters. All accept a scalar or a list (cycled). |
+
+---
+
+#### `QuickLayout.circle()`
+
+```python
+QuickLayout.circle(
+    image_paths,
+    W: int,
+    H: int,
+    n: int,
+    radius: float       = 0.35,
+    center: tuple       = None,
+    start_angle: float  = 90.0,
+    size: tuple         = (150, 150),
+    target_freq         = 10.0,
+    flicker_mode        = FlickerMode.APPROXIMATION,
+    flicker_type        = FlickerType.ON_OFF,
+    color_mode          = ColorMode.COLOUR,
+    phase               = 0.0,
+) -> list[Stimulus]
+```
+
+Arranges `n` stimuli equally spaced around a circle. Stimuli are ordered clockwise from `start_angle`.
+
+| Parameter | Description |
+|---|---|
+| `image_paths` | Image path(s). Scalar or list (cycled). |
+| `W`, `H` | Screen width and height in pixels. |
+| `n` | Number of stimuli. |
+| `radius` | Circle radius as a fraction of `min(W, H) / 2`. E.g. `0.35` uses 35% of the half-screen dimension. |
+| `center` | `(x, y)` pixel coordinates of the circle centre. Defaults to `(W // 2, H // 2)`. |
+| `start_angle` | Angle in degrees where the first stimulus is placed. `90°` = top (12 o'clock). Stimuli proceed clockwise. |
+| `target_freq` | Flicker frequency in Hz. Scalar or list (cycled). |
+| `flicker_mode`, `flicker_type`, `color_mode`, `phase` | Stimulus parameters. All accept a scalar or a list (cycled). |
+
+---
+
+#### `QuickLayout.checkerboard()`
+
+```python
+QuickLayout.checkerboard(
+    image_paths_a,
+    image_paths_b,
+    W: int,
+    H: int,
+    rows: int,
+    cols: int,
+    size: tuple         = (150, 150),
+    target_freq_a       = 10.0,
+    target_freq_b       = 12.0,
+    margin: float       = 0.10,
+    flicker_mode        = FlickerMode.APPROXIMATION,
+    flicker_type        = FlickerType.ON_OFF,
+    color_mode          = ColorMode.COLOUR,
+    phase_a             = 0.0,
+    phase_b             = 0.0,
+) -> list[Stimulus]
+```
+
+Arranges stimuli in a `rows × cols` grid where cells alternate between two groups (A and B) in a checkerboard pattern. Group A occupies cells where `(row + col) % 2 == 0`; group B occupies cells where `(row + col) % 2 == 1`:
+
+```
+A  B  A  B
+B  A  B  A
+A  B  A  B
+```
+
+This is particularly suited to SSVEP paradigms where two interleaved target sets flicker at different frequencies (or with different images), as the spatial interleaving prevents adaptation to a single spatial location.
+
+| Parameter | Description |
+|---|---|
+| `image_paths_a`, `image_paths_b` | Image paths for group A and group B. Each accepts a scalar or list (cycled within its group). |
+| `W`, `H` | Screen width and height in pixels. |
+| `rows`, `cols` | Grid dimensions. |
+| `size` | Stimulus display size in pixels. |
+| `target_freq_a`, `target_freq_b` | Flicker frequencies for group A and group B. Each accepts a scalar or list cycled within its group. |
+| `margin` | Fractional screen margin on each edge (0.0–0.5). |
+| `flicker_mode`, `flicker_type`, `color_mode` | Shared stimulus parameters for all cells. |
+| `phase_a`, `phase_b` | Phase offsets for group A and group B. Each accepts a scalar or list. |
+
+---
+
+### 5.7 Image Processing Helpers
+
+These module-level functions are called internally by `Stimulus.__init__()` but can also be used independently on any `pygame.Surface`.
 
 ```python
 _to_greyscale(surf: pygame.Surface) -> pygame.Surface
 ```
-Returns a greyscale copy of `surf`, preserving per-pixel alpha. Uses `pygame.surfarray` (numpy) if available; falls back to a pure-pygame pixel loop otherwise.
+Returns a greyscale copy of `surf` using ITU-R BT.601 luminance coefficients, preserving per-pixel alpha. Uses `pygame.surfarray` (numpy) if available; falls back to a pure-pygame pixel loop otherwise.
 
 ```python
 _to_negative(surf: pygame.Surface) -> pygame.Surface
 ```
-Returns a colour-inverted copy of `surf` with RGB channels replaced by `255 − R`, `255 − G`, `255 − B`. Alpha is preserved. Uses `pygame.surfarray` (numpy) if available; falls back to a pure-pygame pixel loop otherwise.
+Returns a colour-inverted copy of `surf` — RGB channels replaced by `255 − R`, `255 − G`, `255 − B` — with alpha preserved. Uses `pygame.surfarray` (numpy) if available; falls back to a pure-pygame pixel loop otherwise.
 
 ---
 
@@ -294,6 +425,10 @@ FULLSCREEN = True  # False for a windowed development mode
 
 **Step 4 — Build your stimulus list**
 
+There are two approaches. Use whichever is more convenient.
+
+*Option A — manual stimulus list:*
+
 ```python
 STIMULI = [
     Stimulus(
@@ -306,16 +441,32 @@ STIMULI = [
         color_mode   = ColorMode.GREYSCALE,
         phase        = 0.0,
     ),
-    Stimulus(
-        image_path   = "face.png",
-        position     = (W // 4, H // 2),
-        size         = (150, 150),
-        target_freq  = 12.0,
-        flicker_mode = FlickerMode.FRAME_COUNT,
-        flicker_type = FlickerType.ON_OFF,
-        color_mode   = ColorMode.COLOUR,
-    ),
 ]
+```
+
+*Option B — `QuickLayout` factory (recommended for standard arrangements):*
+
+```python
+# 2 × 4 grid at 8–15 Hz
+STIMULI = QuickLayout.grid(
+    "target.png", W, H, rows=2, cols=4,
+    target_freq  = [8, 9, 10, 11, 12, 13, 14, 15],
+    flicker_type = FlickerType.ON_NEGATIVE,
+)
+
+# 8 stimuli in a circle at 8–15 Hz
+STIMULI = QuickLayout.circle(
+    "target.png", W, H, n=8,
+    target_freq = [8, 9, 10, 11, 12, 13, 14, 15],
+    radius      = 0.38,
+)
+
+# 3 × 4 checkerboard — faces at 10 Hz, houses at 12 Hz
+STIMULI = QuickLayout.checkerboard(
+    "face.png", "house.png", W, H, rows=3, cols=4,
+    target_freq_a = 10.0,
+    target_freq_b = 12.0,
+)
 ```
 
 > **Important.** `pygame.display.set_mode()` must be called *before* the `Stimulus` list is built whenever stimulus positions are computed from `pygame.display.Info()`. The provided entry-point template handles this automatically.
@@ -326,7 +477,7 @@ STIMULI = [
 python blinking_stimuli.py
 ```
 
-Press **Escape** or close the window to exit.
+Press **Escape** or close the window to exit. A configuration table is printed to the console at startup (see Section 9).
 
 ---
 
@@ -361,31 +512,71 @@ STIMULI = [
 ]
 ```
 
-Produces a 10 Hz colour checkerboard flickering between visible and blank at the screen centre.
+A single 10 Hz colour stimulus at the screen centre, alternating between visible and blank.
 
 ---
 
-### Example 2 — Greyscale stimulus with negative flicker
+### Example 2 — `QuickLayout.grid`: 2 × 4 frequency-tagged array
 
 ```python
-STIMULI = [
-    Stimulus(
-        image_path   = "face.png",
-        position     = (W // 2, H // 2),
-        size         = (200, 200),
-        target_freq  = 8.0,
-        flicker_mode = FlickerMode.APPROXIMATION,
-        flicker_type = FlickerType.ON_NEGATIVE,
-        color_mode   = ColorMode.GREYSCALE,
-    ),
-]
+STIMULI = QuickLayout.grid(
+    image_paths  = "target.png",
+    W=W, H=H,
+    rows         = 2,
+    cols         = 4,
+    size         = (150, 150),
+    target_freq  = [8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+    flicker_type = FlickerType.ON_NEGATIVE,
+    color_mode   = ColorMode.GREYSCALE,
+)
 ```
 
-Displays a greyscale face image alternating with its luminance-inverted version at 8 Hz. This configuration maximises local contrast across each flicker cycle and may elicit stronger SSVEP responses.
+Eight greyscale targets in a 2 × 4 grid, each at a different frequency from 8–15 Hz with ON/negative flicker. Replicates the eight-target paradigm of Nakanishi et al. (2014) in two lines of code.
 
 ---
 
-### Example 3 — Four-target array with phase coding
+### Example 3 — `QuickLayout.circle`: ring of 6 targets
+
+```python
+STIMULI = QuickLayout.circle(
+    image_paths = ["cat.png", "dog.png", "car.png",
+                   "face.png", "house.png", "tree.png"],
+    W=W, H=H,
+    n           = 6,
+    radius      = 0.38,
+    start_angle = 90.0,
+    size        = (140, 140),
+    target_freq = [8.0, 9.5, 11.0, 12.5, 14.0, 15.5],
+    flicker_type= FlickerType.ON_NEGATIVE,
+)
+```
+
+Six distinct images arranged clockwise starting from the top of the screen, each at a different frequency. Suitable for object-category SSVEP designs.
+
+---
+
+### Example 4 — `QuickLayout.checkerboard`: two interleaved categories
+
+```python
+STIMULI = QuickLayout.checkerboard(
+    image_paths_a = "face.png",
+    image_paths_b = "house.png",
+    W=W, H=H,
+    rows          = 3,
+    cols          = 4,
+    size          = (130, 130),
+    target_freq_a = 10.0,
+    target_freq_b = 12.0,
+    flicker_type  = FlickerType.ON_NEGATIVE,
+    color_mode    = ColorMode.GREYSCALE,
+)
+```
+
+A 3 × 4 checkerboard with face images at 10 Hz interleaved with house images at 12 Hz, enabling two-category SSVEP classification. The spatial interleaving ensures each frequency occupies a distributed and balanced set of screen locations.
+
+---
+
+### Example 5 — Phase-coded array (manual)
 
 ```python
 STIMULI = [
@@ -401,30 +592,6 @@ STIMULI = [
 ```
 
 Four greyscale stimuli all at 10 Hz with 90° phase offsets (0, 0.25, 0.5, 0.75 cycles), enabling phase-based target coding as described in Jia et al. (2011). Requires `FlickerMode.APPROXIMATION` (the default).
-
----
-
-### Example 4 — Eight-target BCI array (Nakanishi et al., 2014)
-
-```python
-freqs     = [8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
-positions = [...]   # eight (x, y) centre positions
-
-STIMULI = [
-    Stimulus(
-        image_path   = f"target_{i+1}.png",
-        position     = positions[i],
-        size         = (120, 120),
-        target_freq  = freqs[i],
-        flicker_mode = FlickerMode.APPROXIMATION,
-        flicker_type = FlickerType.ON_NEGATIVE,
-        color_mode   = ColorMode.COLOUR,
-    )
-    for i in range(8)
-]
-```
-
-Replicates the eight-target BCI paradigm of Nakanishi et al. (2014) at frequencies 8–15 Hz. At a 75 Hz refresh rate all frequencies are handled accurately by the approximation method.
 
 ---
 
@@ -494,4 +661,4 @@ For phase-coded paradigms, the following may also be relevant:
 
 ---
 
-*Documentation version: 2.0. Corresponds to `blinking_stimuli.py` with `FlickerType`, `ColorMode`, and reformatted startup diagnostics.*
+*Documentation version: 3.0. Corresponds to `blinking_stimuli.py` with `FlickerType`, `ColorMode`, auto-sizing startup diagnostics, and the `QuickLayout` factory class.*
