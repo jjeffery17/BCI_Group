@@ -34,12 +34,13 @@ A Python stimulus presentation tool for flickering image displays, designed for 
 
 `blinking_stimuli.py` renders one or more image stimuli on a fullscreen black background, each flickering independently at a configurable frequency. It is intended as a lightweight, self-contained stimulus presentation tool for laboratory settings, particularly for EEG paradigms that rely on frequency-tagged visual stimulation such as SSVEP-based brain-computer interfaces (BCIs).
 
-Each stimulus is configured independently along four dimensions:
+Each stimulus is configured independently along five dimensions:
 
 - **Scheduling mode** — how the on/off timing is computed frame-by-frame (`FlickerMode`)
 - **Flicker type** — what is shown during the OFF half-cycle: blank screen or colour negative (`FlickerType`)
 - **Colour mode** — whether the image is presented in full colour or greyscale (`ColorMode`)
 - **Frequency and phase** — the target frequency in Hz and an optional initial phase offset
+- **Pixelation** — an optional mosaic effect that reduces image resolution before flicker generation
 
 Stimuli can be defined individually via the `Stimulus` class, or generated automatically from common spatial arrangements using the `QuickLayout` factory class, which provides built-in grid, circle, and checkerboard layouts.
 
@@ -122,9 +123,11 @@ blinking_stimuli.py
 │
 ├── _to_greyscale(surf)  Converts a pygame Surface to greyscale (ITU-R BT.601)
 ├── _to_negative(surf)   Returns colour-inverted copy of a pygame Surface
+├── _to_pixelated(surf, block_size)
+│                        Returns a mosaic copy: downscale → nearest-neighbour upscale
 │
 ├── Stimulus             (one per visual target)
-│   ├── __init__()       Loads image, applies ColorMode, pre-computes OFF surface
+│   ├── __init__()       Loads image, applies ColorMode + pixelation, pre-computes OFF surface
 │   ├── _configure()     Called by StimulusDisplay; computes frame scheduling
 │   ├── _on_phase        (property) True during the ON half-cycle
 │   ├── update()         Advances frame counter by 1
@@ -142,11 +145,7 @@ blinking_stimuli.py
     └── checkerboard()   rows × cols grid with two interleaved A/B groups
 ```
 
-Image processing is performed once at construction time: `_to_greyscale()` converts the loaded image if `ColorMode.GREYSCALE` is selected, and `_to_negative()` pre-computes the inverted surface if `FlickerType.ON_NEGATIVE` is selected. Both are stored as pygame Surfaces (`_image_on` and `_image_off`) so that no per-frame computation is required.
-
-The render loop follows the sequence: poll events → clear screen → draw all stimuli → flip display buffer → advance all frame counters. Updating frame counters *after* drawing ensures that frame 0 is the first frame actually shown, which is important for phase-accurate onset timing.
-
-`QuickLayout` methods are pure spatial helpers — they compute pixel positions and construct `Stimulus` objects, but have no interaction with the display or event loop. Their output is a plain `list[Stimulus]` that is passed directly to `StimulusDisplay`.
+Image processing is performed once at construction time in a fixed pipeline: scale to `size` → greyscale (if selected) → pixelate (if selected) → compute negative (if `ON_NEGATIVE`). Applying pixelation before negative generation means both the ON and OFF surfaces are pixelated at the same block size, ensuring the mosaic boundaries remain spatially stable across the entire flicker cycle.
 
 ---
 
@@ -209,6 +208,7 @@ Stimulus(
     flicker_type : FlickerType = FlickerType.ON_OFF,
     color_mode   : ColorMode   = ColorMode.COLOUR,
     phase        : float = 0.0,
+    pixelate     : int | None = None,
 )
 ```
 
@@ -222,6 +222,7 @@ Stimulus(
 | `flicker_type` | `FlickerType` | What to display during the OFF half-cycle. Defaults to `FlickerType.ON_OFF`. |
 | `color_mode` | `ColorMode` | Whether to convert the image to greyscale. Defaults to `ColorMode.COLOUR`. |
 | `phase` | `float` | Initial phase offset in `[0.0, 1.0)`. `0.0` begins in the ON half-cycle; `0.5` begins in the OFF half-cycle. Only used in `APPROXIMATION` mode. |
+| `pixelate` | `int` or `None` | Block size in pixels for a mosaic (pixelation) effect. Each `block_size × block_size` region is averaged to a single colour. `None` or `1` disables pixelation (default: `None`). Applied before flicker generation, so both ON and OFF surfaces are pixelated at the same resolution. |
 
 **Properties**
 
@@ -292,6 +293,7 @@ QuickLayout.grid(
     flicker_type        = FlickerType.ON_OFF,
     color_mode          = ColorMode.COLOUR,
     phase               = 0.0,
+    pixelate            = None,
 ) -> list[Stimulus]
 ```
 
@@ -306,6 +308,7 @@ Arranges stimuli in a regular `rows × cols` rectangular grid. Positions are com
 | `target_freq` | Flicker frequency in Hz. Scalar or list (cycled). |
 | `margin` | Fractional screen margin reserved on each edge (0.0–0.5). E.g. `0.10` leaves a 10% border. |
 | `flicker_mode`, `flicker_type`, `color_mode`, `phase` | Stimulus parameters. All accept a scalar or a list (cycled). |
+| `pixelate` | Block size for pixelation in pixels. `None` disables. Scalar or list (cycled). |
 
 ---
 
@@ -326,6 +329,7 @@ QuickLayout.circle(
     flicker_type        = FlickerType.ON_OFF,
     color_mode          = ColorMode.COLOUR,
     phase               = 0.0,
+    pixelate            = None,
 ) -> list[Stimulus]
 ```
 
@@ -341,6 +345,7 @@ Arranges `n` stimuli equally spaced around a circle. Stimuli are ordered clockwi
 | `start_angle` | Angle in degrees where the first stimulus is placed. `90°` = top (12 o'clock). Stimuli proceed clockwise. |
 | `target_freq` | Flicker frequency in Hz. Scalar or list (cycled). |
 | `flicker_mode`, `flicker_type`, `color_mode`, `phase` | Stimulus parameters. All accept a scalar or a list (cycled). |
+| `pixelate` | Block size for pixelation in pixels. `None` disables. Scalar or list (cycled). |
 
 ---
 
@@ -363,6 +368,8 @@ QuickLayout.checkerboard(
     color_mode          = ColorMode.COLOUR,
     phase_a             = 0.0,
     phase_b             = 0.0,
+    pixelate_a          = None,
+    pixelate_b          = None,
 ) -> list[Stimulus]
 ```
 
@@ -386,6 +393,7 @@ This is particularly suited to SSVEP paradigms where two interleaved target sets
 | `margin` | Fractional screen margin on each edge (0.0–0.5). |
 | `flicker_mode`, `flicker_type`, `color_mode` | Shared stimulus parameters for all cells. |
 | `phase_a`, `phase_b` | Phase offsets for group A and group B. Each accepts a scalar or list. |
+| `pixelate_a`, `pixelate_b` | Block sizes for pixelation for group A and group B respectively. `None` disables for that group. Each accepts a scalar or list cycled within its group. |
 
 ---
 
@@ -402,6 +410,11 @@ Returns a greyscale copy of `surf` using ITU-R BT.601 luminance coefficients, pr
 _to_negative(surf: pygame.Surface) -> pygame.Surface
 ```
 Returns a colour-inverted copy of `surf` — RGB channels replaced by `255 − R`, `255 − G`, `255 − B` — with alpha preserved. Uses `pygame.surfarray` (numpy) if available; falls back to a pure-pygame pixel loop otherwise.
+
+```python
+_to_pixelated(surf: pygame.Surface, block_size: int) -> pygame.Surface
+```
+Returns a pixelated copy of `surf` at the same display dimensions. The image is downscaled to `ceil(w / block_size) × ceil(h / block_size)` using bilinear interpolation, then upscaled back to `w × h` using nearest-neighbour scaling to preserve hard block edges. `block_size ≤ 1` returns an unmodified copy.
 
 ---
 
@@ -440,6 +453,7 @@ STIMULI = [
         flicker_type = FlickerType.ON_NEGATIVE,
         color_mode   = ColorMode.GREYSCALE,
         phase        = 0.0,
+        pixelate     = 8,    # 8×8 px blocks; None to disable
     ),
 ]
 ```
@@ -447,25 +461,29 @@ STIMULI = [
 *Option B — `QuickLayout` factory (recommended for standard arrangements):*
 
 ```python
-# 2 × 4 grid at 8–15 Hz
+# 2 × 4 grid at 8–15 Hz, escalating pixelation across columns
 STIMULI = QuickLayout.grid(
     "target.png", W, H, rows=2, cols=4,
     target_freq  = [8, 9, 10, 11, 12, 13, 14, 15],
     flicker_type = FlickerType.ON_NEGATIVE,
+    pixelate     = [None, 4, 8, 16, None, 4, 8, 16],
 )
 
-# 8 stimuli in a circle at 8–15 Hz
+# 8 stimuli in a circle at 8–15 Hz, uniform pixelation
 STIMULI = QuickLayout.circle(
     "target.png", W, H, n=8,
     target_freq = [8, 9, 10, 11, 12, 13, 14, 15],
     radius      = 0.38,
+    pixelate    = 8,
 )
 
-# 3 × 4 checkerboard — faces at 10 Hz, houses at 12 Hz
+# 3 × 4 checkerboard — pixelated faces at 10 Hz, sharp houses at 12 Hz
 STIMULI = QuickLayout.checkerboard(
     "face.png", "house.png", W, H, rows=3, cols=4,
     target_freq_a = 10.0,
     target_freq_b = 12.0,
+    pixelate_a    = 10,
+    pixelate_b    = None,
 )
 ```
 
@@ -641,6 +659,8 @@ A warnings section is only shown when one or more `FRAME_COUNT` stimuli deviate 
 
 **Phase parameter.** The `phase` parameter shifts the start of the ON half-cycle by a fraction of one full period, defined in normalised units (0.0–1.0, where 1.0 = one full cycle). A phase of `0.25` corresponds to a 90° shift. This parameter is only active in `APPROXIMATION` mode and is silently ignored in `FRAME_COUNT` mode.
 
+**Pixelation.** The `pixelate` parameter applies a mosaic effect by downscaling the image to `ceil(w / block_size) × ceil(h / block_size)` and then upscaling back with nearest-neighbour interpolation. This intentionally degrades spatial resolution, reducing high-frequency spatial content in the stimulus. Because pixelation is applied before negative generation, both the ON and OFF phase surfaces share identical block boundaries, so the mosaic grid is perceptually stable across the entire flicker cycle — only the colour content alternates, not the spatial structure. Larger block sizes reduce spatial information more aggressively. A block size of 1 or `None` disables the effect entirely.
+
 **Number of stimuli.** There is no hard upper limit on the number of simultaneous stimuli. Performance may degrade with very large images or many stimuli on constrained hardware; all stimuli are rendered synchronously within a single frame.
 
 ---
@@ -661,4 +681,4 @@ For phase-coded paradigms, the following may also be relevant:
 
 ---
 
-*Documentation version: 3.0. Corresponds to `blinking_stimuli.py` with `FlickerType`, `ColorMode`, auto-sizing startup diagnostics, and the `QuickLayout` factory class.*
+*Documentation version: 4.0. Corresponds to `blinking_stimuli.py` with `FlickerType`, `ColorMode`, auto-sizing startup diagnostics, `QuickLayout` factory class, and `pixelate` parameter.*

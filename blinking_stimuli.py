@@ -134,6 +134,46 @@ def _to_negative(surf: pygame.Surface) -> pygame.Surface:
     return out
 
 
+def _to_pixelated(surf: pygame.Surface, block_size: int) -> pygame.Surface:
+    """
+    Return a pixelated copy of *surf* at the same display size.
+
+    The image is downscaled to ``ceil(w / block_size) × ceil(h / block_size)``
+    using bilinear smoothing (so each block correctly averages its source
+    pixels), then upscaled back to the original size using nearest-neighbour
+    scaling (so block boundaries remain hard-edged).
+
+    Alpha channel is preserved because both transform steps operate on a
+    surface that already carries alpha information.
+
+    Parameters
+    ----------
+    surf       : pygame.Surface
+        Source surface.  May have per-pixel alpha (SRCALPHA).
+    block_size : int
+        Side length of each output pixel block in display pixels.
+        1 → no change.  8 → 8×8 pixel blocks.
+
+    Returns
+    -------
+    pygame.Surface
+        A new surface of the same size as *surf* with the pixelated effect
+        applied.
+    """
+    if block_size <= 1:
+        return surf.copy()
+
+    w, h       = surf.get_size()
+    small_w    = max(1, math.ceil(w / block_size))
+    small_h    = max(1, math.ceil(h / block_size))
+
+    # Downscale with smoothscale: correctly averages colours within each block.
+    small = pygame.transform.smoothscale(surf, (small_w, small_h))
+
+    # Upscale with scale (nearest-neighbour): creates hard-edged blocks.
+    return pygame.transform.scale(small, (w, h))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Stimulus
 # ──────────────────────────────────────────────────────────────────────────────
@@ -164,6 +204,14 @@ class Stimulus:
         Initial phase offset in [0.0, 1.0).  0.5 starts in the OFF half-cycle.
         Useful for phase-coded SSVEP paradigms.
         Only applied in APPROXIMATION mode; ignored in FRAME_COUNT mode.
+    pixelate     : int | None
+        Block size in pixels for a pixelation effect applied before flicker
+        generation.  Each ``block_size × block_size`` region of the source
+        image is collapsed to a single uniform colour, producing a mosaic
+        appearance.  ``None`` or ``1`` disables pixelation (default: ``None``).
+        The effect is baked in at construction time, so both the ON and OFF
+        surfaces (including the colour-negative for ON_NEGATIVE) are pixelated
+        consistently with no per-frame cost.
     """
 
     def __init__(
@@ -176,6 +224,7 @@ class Stimulus:
         flicker_type: FlickerType = FlickerType.ON_OFF,
         color_mode: ColorMode = ColorMode.COLOUR,
         phase: float = 0.0,
+        pixelate: int = None,
     ):
         self.position     = position
         self.target_freq  = target_freq
@@ -183,6 +232,7 @@ class Stimulus:
         self.flicker_type = flicker_type
         self.color_mode   = color_mode
         self.phase        = phase % 1.0
+        self.pixelate     = int(pixelate) if (pixelate is not None and int(pixelate) > 1) else None
 
         # ── load and process image ───────────────────────────────────────────
         raw = pygame.image.load(image_path).convert_alpha()
@@ -191,6 +241,9 @@ class Stimulus:
 
         if color_mode is ColorMode.GREYSCALE:
             raw = _to_greyscale(raw)
+
+        if self.pixelate is not None:
+            raw = _to_pixelated(raw, self.pixelate)
 
         self._image_on  = raw
         self._image_off = _to_negative(raw) if flicker_type is FlickerType.ON_NEGATIVE else None
@@ -309,7 +362,7 @@ class StimulusDisplay:
         # ── build table cell data ────────────────────────────────────────────
         headers = [
             "#", "Position", "Sched. Mode",
-            "Target (Hz)", "Actual (Hz)", "Flicker", "Colour", "Phase",
+            "Target (Hz)", "Actual (Hz)", "Flicker", "Colour", "Pixelate", "Phase",
         ]
         rows = [
             [
@@ -320,6 +373,7 @@ class StimulusDisplay:
                 f"{s.actual_freq:.4f}",
                 s.flicker_type.value,
                 s.color_mode.value,
+                str(s.pixelate) if s.pixelate is not None else "—",
                 f"{s.phase:.3f}",
             ]
             for i, s in enumerate(self.stimuli, 1)
@@ -501,7 +555,7 @@ class QuickLayout:
 
     @staticmethod
     def _make(image_paths, positions, size, target_freqs, phases,
-              flicker_mode, flicker_type, color_mode) -> list:
+              flicker_mode, flicker_type, color_mode, pixelate) -> list:
         """Construct a Stimulus for each position with broadcast parameters."""
         stimuli = []
         for i, pos in enumerate(positions):
@@ -514,6 +568,7 @@ class QuickLayout:
                 flicker_type = QuickLayout._get(flicker_type, i),
                 color_mode   = QuickLayout._get(color_mode,   i),
                 phase        = QuickLayout._get(phases,       i),
+                pixelate     = QuickLayout._get(pixelate,     i),
             ))
         return stimuli
 
@@ -533,6 +588,7 @@ class QuickLayout:
         flicker_type             = FlickerType.ON_OFF,
         color_mode               = ColorMode.COLOUR,
         phase                    = 0.0,
+        pixelate                 = None,
     ) -> list:
         """
         Arrange stimuli in a regular *rows* × *cols* rectangular grid.
@@ -555,6 +611,9 @@ class QuickLayout:
         flicker_mode, flicker_type, color_mode, phase
             Passed directly to each ``Stimulus``.  All accept a scalar
             (shared by every stimulus) or a list (cycled).
+        pixelate    : int or None or list[int | None]
+            Block size for pixelation in pixels.  ``None`` disables.
+            Cycled if a list.
 
         Returns
         -------
@@ -580,7 +639,7 @@ class QuickLayout:
         ]
         return QuickLayout._make(image_paths, positions, size,
                                  target_freq, phase,
-                                 flicker_mode, flicker_type, color_mode)
+                                 flicker_mode, flicker_type, color_mode, pixelate)
 
     # ── circle ────────────────────────────────────────────────────────────────
 
@@ -599,6 +658,7 @@ class QuickLayout:
         flicker_type             = FlickerType.ON_OFF,
         color_mode               = ColorMode.COLOUR,
         phase                    = 0.0,
+        pixelate                 = None,
     ) -> list:
         """
         Arrange *n* stimuli equally spaced around a circle.
@@ -625,6 +685,9 @@ class QuickLayout:
         flicker_mode, flicker_type, color_mode, phase
             Passed directly to each ``Stimulus``.  All accept a scalar
             or a list (cycled).
+        pixelate     : int or None or list[int | None]
+            Block size for pixelation in pixels.  ``None`` disables.
+            Cycled if a list.
 
         Returns
         -------
@@ -650,7 +713,7 @@ class QuickLayout:
             ))
         return QuickLayout._make(image_paths, positions, size,
                                  target_freq, phase,
-                                 flicker_mode, flicker_type, color_mode)
+                                 flicker_mode, flicker_type, color_mode, pixelate)
 
     # ── checkerboard ─────────────────────────────────────────────────────────
 
@@ -671,6 +734,8 @@ class QuickLayout:
         color_mode               = ColorMode.COLOUR,
         phase_a                  = 0.0,
         phase_b                  = 0.0,
+        pixelate_a               = None,
+        pixelate_b               = None,
     ) -> list:
         """
         Arrange stimuli in a *rows* × *cols* grid where cells alternate between
@@ -705,6 +770,10 @@ class QuickLayout:
             Shared stimulus parameters applied to all stimuli.
         phase_a, phase_b : float or list[float]
             Phase offsets for group A and group B.
+        pixelate_a, pixelate_b : int or None or list[int | None]
+            Block sizes for pixelation for group A and group B respectively.
+            ``None`` disables pixelation for that group.  Cycled within each
+            group if lists are provided.
 
         Returns
         -------
@@ -737,11 +806,13 @@ class QuickLayout:
                     img   = QuickLayout._get(image_paths_a, idx_a)
                     freq  = QuickLayout._get(target_freq_a, idx_a)
                     ph    = QuickLayout._get(phase_a,       idx_a)
+                    pix   = QuickLayout._get(pixelate_a,    idx_a)
                     idx_a += 1
                 else:
                     img   = QuickLayout._get(image_paths_b, idx_b)
                     freq  = QuickLayout._get(target_freq_b, idx_b)
                     ph    = QuickLayout._get(phase_b,       idx_b)
+                    pix   = QuickLayout._get(pixelate_b,    idx_b)
                     idx_b += 1
 
                 stimuli.append(Stimulus(
@@ -753,6 +824,7 @@ class QuickLayout:
                     flicker_type = QuickLayout._get(flicker_type, len(stimuli)),
                     color_mode   = QuickLayout._get(color_mode,   len(stimuli)),
                     phase        = ph,
+                    pixelate     = pix,
                 ))
 
         return stimuli
@@ -842,29 +914,33 @@ if __name__ == "__main__":
     #           flicker_type = FlickerType.ON_NEGATIVE,
     #           color_mode   = ColorMode.GREYSCALE,
     #           phase        = 0.0,
+    #           pixelate     = 8,      # 8×8 px blocks; None to disable
     #       ),
     #   ]
     #
     # Option B — QuickLayout factory (pick one):
     #
-    #   # 2 × 4 grid, one frequency per cell
+    #   # 2 × 4 grid, one frequency per cell, 8-pixel mosaic
     #   STIMULI = QuickLayout.grid(
     #       "target.png", W, H, rows=2, cols=4,
     #       target_freq=[8, 9, 10, 11, 12, 13, 14, 15],
     #       flicker_type=FlickerType.ON_NEGATIVE,
+    #       pixelate=8,
     #   )
     #
-    #   # 8 stimuli equally spaced around a circle
+    #   # 8 stimuli in a circle, varying pixelation per target
     #   STIMULI = QuickLayout.circle(
     #       "target.png", W, H, n=8,
     #       target_freq=[8, 9, 10, 11, 12, 13, 14, 15],
     #       radius=0.38,
+    #       pixelate=[None, 4, 8, 16, None, 4, 8, 16],
     #   )
     #
-    #   # 3 × 4 checkerboard — two interleaved groups at different frequencies
+    #   # 3 × 4 checkerboard — pixelated A group, sharp B group
     #   STIMULI = QuickLayout.checkerboard(
     #       "face.png", "house.png", W, H, rows=3, cols=4,
     #       target_freq_a=10.0, target_freq_b=12.0,
+    #       pixelate_a=10, pixelate_b=None,
     #   )
     #
     # ─── FREQUENCY GUIDANCE ──────────────────────────────────────────────────
@@ -908,7 +984,9 @@ if __name__ == "__main__":
     paths_b  = [_make_placeholder((80, 120, 220), "B")]
 
     if DEMO_LAYOUT == "grid":
-        # 2 × 4 grid, 8–15 Hz, approximation mode, on/negative flicker
+        # 2 × 4 grid, 8–15 Hz, approximation mode, on/negative flicker.
+        # Pixelation escalates across columns (None, 4, 8, 16) so all four
+        # block sizes are visible side-by-side in each row.
         STIMULI = QuickLayout.grid(
             image_paths  = paths_8,
             W=W, H=H,
@@ -917,6 +995,7 @@ if __name__ == "__main__":
             target_freq  = freqs_8,
             flicker_type = FlickerType.ON_NEGATIVE,
             color_mode   = ColorMode.COLOUR,
+            pixelate     = [None, 4, 8, 16, None, 4, 8, 16],
         )
 
     elif DEMO_LAYOUT == "circle":
