@@ -25,8 +25,14 @@ A Python stimulus presentation tool for flickering image displays, designed for 
 7. [Frequency Constraints by Refresh Rate](#7-frequency-constraints-by-refresh-rate)
 8. [Worked Examples](#8-worked-examples)
 9. [Startup Diagnostics](#9-startup-diagnostics)
-10. [Methodological Considerations](#10-methodological-considerations)
-11. [Citation](#11-citation)
+10. [Vsync and Refresh-Rate Detection](#10-vsync-and-refresh-rate-detection)
+    - 10.1 [Why Refresh-Rate Detection Matters](#101-why-refresh-rate-detection-matters)
+    - 10.2 [Known Failure Modes in pygame](#102-known-failure-modes-in-pygame)
+    - 10.3 [Three-Tier Detection Strategy](#103-three-tier-detection-strategy)
+    - 10.4 [Vsync and the Clock-Tick Bug](#104-vsync-and-the-clock-tick-bug)
+    - 10.5 [Alternative Frameworks](#105-alternative-frameworks)
+11. [Methodological Considerations](#11-methodological-considerations)
+12. [Citation](#12-citation)
 
 ---
 
@@ -34,13 +40,12 @@ A Python stimulus presentation tool for flickering image displays, designed for 
 
 `blinking_stimuli.py` renders one or more image stimuli on a fullscreen black background, each flickering independently at a configurable frequency. It is intended as a lightweight, self-contained stimulus presentation tool for laboratory settings, particularly for EEG paradigms that rely on frequency-tagged visual stimulation such as SSVEP-based brain-computer interfaces (BCIs).
 
-Each stimulus is configured independently along five dimensions:
+Each stimulus is configured independently along four dimensions:
 
 - **Scheduling mode** — how the on/off timing is computed frame-by-frame (`FlickerMode`)
 - **Flicker type** — what is shown during the OFF half-cycle: blank screen or colour negative (`FlickerType`)
 - **Colour mode** — whether the image is presented in full colour or greyscale (`ColorMode`)
 - **Frequency and phase** — the target frequency in Hz and an optional initial phase offset
-- **Pixelation** — an optional mosaic effect that reduces image resolution before flicker generation
 
 Stimuli can be defined individually via the `Stimulus` class, or generated automatically from common spatial arrangements using the `QuickLayout` factory class, which provides built-in grid, circle, and checkerboard layouts.
 
@@ -117,35 +122,44 @@ Nakanishi et al. (2014) compared SSVEP characteristics from both approaches usin
 ```
 blinking_stimuli.py
 │
-├── FlickerMode          (enum)   APPROXIMATION | FRAME_COUNT
-├── FlickerType          (enum)   ON_OFF | ON_NEGATIVE
-├── ColorMode            (enum)   COLOUR | GREYSCALE
+├── FlickerMode              (enum)   APPROXIMATION | FRAME_COUNT
+├── FlickerType              (enum)   ON_OFF | ON_NEGATIVE
+├── ColorMode                (enum)   COLOUR | GREYSCALE
 │
-├── _to_greyscale(surf)  Converts a pygame Surface to greyscale (ITU-R BT.601)
-├── _to_negative(surf)   Returns colour-inverted copy of a pygame Surface
-├── _to_pixelated(surf, block_size)
-│                        Returns a mosaic copy: downscale → nearest-neighbour upscale
+├── _detect_refresh_rate_os()  OS-native refresh-rate query (no extra deps)
+│                              Windows: ctypes + GDI GetDeviceCaps(VREFRESH)
+│                              Linux:   xrandr subprocess parse
+│                              macOS:   system_profiler subprocess parse
 │
-├── Stimulus             (one per visual target)
-│   ├── __init__()       Loads image, applies ColorMode + pixelation, pre-computes OFF surface
-│   ├── _configure()     Called by StimulusDisplay; computes frame scheduling
-│   ├── _on_phase        (property) True during the ON half-cycle
-│   ├── update()         Advances frame counter by 1
-│   ├── draw()           Blits ON or OFF image to surface
-│   └── actual_freq      (property) True delivered frequency
+├── _to_greyscale(surf)      Converts a pygame Surface to greyscale (ITU-R BT.601)
+├── _to_negative(surf)       Returns colour-inverted copy of a pygame Surface
+├── _to_pixelated(surf, n)   Returns mosaic copy: smooth-downscale → nearest-upscale
 │
-├── StimulusDisplay      (application / event loop)
-│   ├── __init__()       Stores stimuli list and display settings
-│   ├── _print_startup() Renders auto-sizing configuration table to stdout
-│   └── run()            Opens window, configures stimuli, runs render loop
+├── Stimulus                 (one per visual target)
+│   ├── __init__()           Loads image, applies ColorMode + pixelation, pre-computes OFF surface
+│   ├── _configure()         Called by StimulusDisplay; computes frame scheduling
+│   ├── _on_phase            (property) True during the ON half-cycle
+│   ├── update()             Advances frame counter by 1
+│   ├── draw()               Blits ON or OFF image to surface
+│   └── actual_freq          (property) True delivered frequency
 │
-└── QuickLayout          (layout factory — returns list[Stimulus])
-    ├── grid()           Regular rows × cols rectangular grid
-    ├── circle()         N stimuli equally spaced around a circle
-    └── checkerboard()   rows × cols grid with two interleaved A/B groups
+├── StimulusDisplay          (application / event loop)
+│   ├── __init__()           Stores stimuli list and display settings
+│   ├── _print_startup()     Renders auto-sizing configuration table to stdout
+│   └── run()                Three-tier refresh detection → vsync open → configure
+│                            → render loop (flip-then-update ordering)
+│
+└── QuickLayout              (layout factory — returns list[Stimulus])
+    ├── grid()               Regular rows × cols rectangular grid
+    ├── circle()             N stimuli equally spaced around a circle
+    └── checkerboard()       rows × cols grid with two interleaved A/B groups
 ```
 
-Image processing is performed once at construction time in a fixed pipeline: scale to `size` → greyscale (if selected) → pixelate (if selected) → compute negative (if `ON_NEGATIVE`). Applying pixelation before negative generation means both the ON and OFF surfaces are pixelated at the same block size, ensuring the mosaic boundaries remain spatially stable across the entire flicker cycle.
+Image processing is performed once at construction time in a fixed pipeline: scale to `size` → greyscale (if selected) → pixelate (if selected) → compute negative (if `ON_NEGATIVE`). All surfaces are stored as pre-rendered pygame Surfaces so no per-frame computation is required.
+
+The render loop follows the sequence: poll events → clear screen → draw all stimuli → **flip display buffer** → advance all frame counters. Placing `update()` calls *after* `flip()` is critical: when vsync is active, `flip()` blocks until the next vertical retrace, so frame counters increment only after the frame is physically on-screen. This preserves phase accuracy for onset timing.
+
+`QuickLayout` methods are pure spatial helpers — they compute pixel positions and construct `Stimulus` objects with no interaction with the display or event loop.
 
 ---
 
@@ -208,7 +222,6 @@ Stimulus(
     flicker_type : FlickerType = FlickerType.ON_OFF,
     color_mode   : ColorMode   = ColorMode.COLOUR,
     phase        : float = 0.0,
-    pixelate     : int | None = None,
 )
 ```
 
@@ -222,7 +235,6 @@ Stimulus(
 | `flicker_type` | `FlickerType` | What to display during the OFF half-cycle. Defaults to `FlickerType.ON_OFF`. |
 | `color_mode` | `ColorMode` | Whether to convert the image to greyscale. Defaults to `ColorMode.COLOUR`. |
 | `phase` | `float` | Initial phase offset in `[0.0, 1.0)`. `0.0` begins in the ON half-cycle; `0.5` begins in the OFF half-cycle. Only used in `APPROXIMATION` mode. |
-| `pixelate` | `int` or `None` | Block size in pixels for a mosaic (pixelation) effect. Each `block_size × block_size` region is averaged to a single colour. `None` or `1` disables pixelation (default: `None`). Applied before flicker generation, so both ON and OFF surfaces are pixelated at the same resolution. |
 
 **Properties**
 
@@ -293,7 +305,6 @@ QuickLayout.grid(
     flicker_type        = FlickerType.ON_OFF,
     color_mode          = ColorMode.COLOUR,
     phase               = 0.0,
-    pixelate            = None,
 ) -> list[Stimulus]
 ```
 
@@ -308,7 +319,6 @@ Arranges stimuli in a regular `rows × cols` rectangular grid. Positions are com
 | `target_freq` | Flicker frequency in Hz. Scalar or list (cycled). |
 | `margin` | Fractional screen margin reserved on each edge (0.0–0.5). E.g. `0.10` leaves a 10% border. |
 | `flicker_mode`, `flicker_type`, `color_mode`, `phase` | Stimulus parameters. All accept a scalar or a list (cycled). |
-| `pixelate` | Block size for pixelation in pixels. `None` disables. Scalar or list (cycled). |
 
 ---
 
@@ -329,7 +339,6 @@ QuickLayout.circle(
     flicker_type        = FlickerType.ON_OFF,
     color_mode          = ColorMode.COLOUR,
     phase               = 0.0,
-    pixelate            = None,
 ) -> list[Stimulus]
 ```
 
@@ -345,7 +354,6 @@ Arranges `n` stimuli equally spaced around a circle. Stimuli are ordered clockwi
 | `start_angle` | Angle in degrees where the first stimulus is placed. `90°` = top (12 o'clock). Stimuli proceed clockwise. |
 | `target_freq` | Flicker frequency in Hz. Scalar or list (cycled). |
 | `flicker_mode`, `flicker_type`, `color_mode`, `phase` | Stimulus parameters. All accept a scalar or a list (cycled). |
-| `pixelate` | Block size for pixelation in pixels. `None` disables. Scalar or list (cycled). |
 
 ---
 
@@ -368,8 +376,6 @@ QuickLayout.checkerboard(
     color_mode          = ColorMode.COLOUR,
     phase_a             = 0.0,
     phase_b             = 0.0,
-    pixelate_a          = None,
-    pixelate_b          = None,
 ) -> list[Stimulus]
 ```
 
@@ -393,7 +399,6 @@ This is particularly suited to SSVEP paradigms where two interleaved target sets
 | `margin` | Fractional screen margin on each edge (0.0–0.5). |
 | `flicker_mode`, `flicker_type`, `color_mode` | Shared stimulus parameters for all cells. |
 | `phase_a`, `phase_b` | Phase offsets for group A and group B. Each accepts a scalar or list. |
-| `pixelate_a`, `pixelate_b` | Block sizes for pixelation for group A and group B respectively. `None` disables for that group. Each accepts a scalar or list cycled within its group. |
 
 ---
 
@@ -410,11 +415,6 @@ Returns a greyscale copy of `surf` using ITU-R BT.601 luminance coefficients, pr
 _to_negative(surf: pygame.Surface) -> pygame.Surface
 ```
 Returns a colour-inverted copy of `surf` — RGB channels replaced by `255 − R`, `255 − G`, `255 − B` — with alpha preserved. Uses `pygame.surfarray` (numpy) if available; falls back to a pure-pygame pixel loop otherwise.
-
-```python
-_to_pixelated(surf: pygame.Surface, block_size: int) -> pygame.Surface
-```
-Returns a pixelated copy of `surf` at the same display dimensions. The image is downscaled to `ceil(w / block_size) × ceil(h / block_size)` using bilinear interpolation, then upscaled back to `w × h` using nearest-neighbour scaling to preserve hard block edges. `block_size ≤ 1` returns an unmodified copy.
 
 ---
 
@@ -453,7 +453,6 @@ STIMULI = [
         flicker_type = FlickerType.ON_NEGATIVE,
         color_mode   = ColorMode.GREYSCALE,
         phase        = 0.0,
-        pixelate     = 8,    # 8×8 px blocks; None to disable
     ),
 ]
 ```
@@ -461,29 +460,25 @@ STIMULI = [
 *Option B — `QuickLayout` factory (recommended for standard arrangements):*
 
 ```python
-# 2 × 4 grid at 8–15 Hz, escalating pixelation across columns
+# 2 × 4 grid at 8–15 Hz
 STIMULI = QuickLayout.grid(
     "target.png", W, H, rows=2, cols=4,
     target_freq  = [8, 9, 10, 11, 12, 13, 14, 15],
     flicker_type = FlickerType.ON_NEGATIVE,
-    pixelate     = [None, 4, 8, 16, None, 4, 8, 16],
 )
 
-# 8 stimuli in a circle at 8–15 Hz, uniform pixelation
+# 8 stimuli in a circle at 8–15 Hz
 STIMULI = QuickLayout.circle(
     "target.png", W, H, n=8,
     target_freq = [8, 9, 10, 11, 12, 13, 14, 15],
     radius      = 0.38,
-    pixelate    = 8,
 )
 
-# 3 × 4 checkerboard — pixelated faces at 10 Hz, sharp houses at 12 Hz
+# 3 × 4 checkerboard — faces at 10 Hz, houses at 12 Hz
 STIMULI = QuickLayout.checkerboard(
     "face.png", "house.png", W, H, rows=3, cols=4,
     target_freq_a = 10.0,
     target_freq_b = 12.0,
-    pixelate_a    = 10,
-    pixelate_b    = None,
 )
 ```
 
@@ -617,37 +612,161 @@ Four greyscale stimuli all at 10 Hz with 90° phase offsets (0, 0.25, 0.5, 0.75 
 
 On each run, `StimulusDisplay.run()` prints a formatted configuration table to standard output before entering the render loop. This provides a permanent record of the stimulus parameters used for a given session and should be logged alongside EEG recordings.
 
-Example output:
+The table now includes a **Vsync** row showing whether hardware vsync was successfully enabled, and a **Pixelate** column per stimulus. Warnings are split into two separate sections: *System Warnings* (refresh-rate detection failures, TARGET_FPS mismatches) and *Stimulus Warnings* (FRAME_COUNT frequency deviations). Each section is omitted entirely when empty.
+
+Example output (vsync active, one FRAME_COUNT deviation):
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│                          Blinking Stimuli — Configuration                            │
-├──────────────────────────────────────────────────────────────────────────────────────┤
-│  Display refresh rate     60.0 Hz                                                    │
-│  Background colour (RGB)  (0, 0, 0)                                                  │
-│  Fullscreen               True                                                       │
-├──────────────────────────────────────────────────────────────────────────────────────┤
-│  #  Position    Sched. Mode  Target (Hz)  Actual (Hz)  Flicker      Colour     Phase │
-│  ────────────────────────────────────────────────────────────────────────────────── │
-│  1  (384, 270)  Approx       8.0000       8.0000       On/Off       Colour     0.000 │
-│  2  (768, 270)  Approx       9.0000       9.0000       On/Off       Greyscale  0.000 │
-│  3  (384, 810)  Frame        12.0000      12.0000      On/Negative  Colour     0.000 │
-│  4  (768, 810)  Frame        13.0000      12.0000      On/Negative  Greyscale  0.000 │
-├──────────────────────────────────────────────────────────────────────────────────────┤
-│                                       Warnings                                       │
-│  ────────────────────────────────────────────────────────────────────────────────── │
-│  Stimulus 4:  FRAME_COUNT: requested 13.000 Hz → actual 12.000 Hz (7.7% deviation). │
-│               Consider FlickerMode.APPROXIMATION.                                    │
-└──────────────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                      Blinking Stimuli — Configuration                                  │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│  Display refresh rate    144.0 Hz                                                                       │
+│  Vsync                   enabled (display.flip blocks on retrace)                                       │
+│  Background colour (RGB) (0, 0, 0)                                                                      │
+│  Fullscreen              True                                                                           │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│  #  Position      Sched. Mode  Target (Hz)  Actual (Hz)  Flicker      Colour     Pixelate  Phase       │
+│  ────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│  1  (480, 270)    Approx       10.0000      10.0000      On/Negative  Colour     —         0.000       │
+│  2  (960, 270)    Approx       12.0000      12.0000      On/Negative  Greyscale  8         0.000       │
+│  3  (480, 810)    Frame        10.0000      10.0000      On/Negative  Colour     —         0.000       │
+│  4  (960, 810)    Frame        11.0000      9.0000       On/Negative  Greyscale  —         0.000       │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                         Stimulus Warnings                                              │
+│  ──────────────────────────────────────────────────────────────────────────────────────────────────── │
+│  Stimulus 4:  FRAME_COUNT: requested 11.000 Hz → actual 9.000 Hz (18.2% deviation).                   │
+│               Consider FlickerMode.APPROXIMATION.                                                      │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-A warnings section is only shown when one or more `FRAME_COUNT` stimuli deviate more than 1% from their requested frequency. If no warnings exist, the warnings section is omitted.
+Example with a failed refresh-rate detection (System Warnings section visible):
+
+```
+├──────────────────────────────────────────┤
+│             System Warnings              │
+│  ──────────────────────────────────────  │
+│  Display refresh rate could not be       │
+│  detected automatically. Using           │
+│  TARGET_FPS = 60 Hz. Verify this         │
+│  matches your monitor's native rate.     │
+└──────────────────────────────────────────┘
+```
 
 ---
 
-## 10. Methodological Considerations
+## 10. Vsync and Refresh-Rate Detection
 
-**Monitor synchronisation.** Accurate flicker timing depends on the pygame render loop advancing exactly one frame per display refresh. Setting `TARGET_FPS` to match the monitor's native refresh rate generally achieves this, but it is not a substitute for hardware-level verification. For studies with strict timing requirements, an external photodiode placed at a corner of the screen and recorded on a parallel EEG channel is strongly recommended.
+### 10.1 Why Refresh-Rate Detection Matters
+
+All flicker scheduling formulas divide frame counts by the display refresh rate $f_s$. If the value of $f_s$ used in the formula differs from the actual hardware rate, every stimulus frequency is scaled by the same error factor:
+
+$$f_{delivered} = f_{target} \times \frac{f_s^{(actual)}}{f_s^{(used)}}$$
+
+For example, if `TARGET_FPS = 60` but the monitor runs at 120 Hz, all requested frequencies are doubled — a 10 Hz stimulus flickers at 20 Hz. Getting $f_s$ right is therefore the single most impactful correctness requirement in the entire codebase.
+
+### 10.2 Known Failure Modes in pygame
+
+The original single-method detection had three independent failure modes:
+
+**1. `get_current_refresh_rate()` returns 0 silently.**
+SDL2 exposes the display mode's `refresh_rate` field, but many drivers (notably on Windows with certain GPU/driver versions, and on virtual machines) populate this field as `0` even when the call succeeds. The original `if detected > 0` guard correctly rejects this, but does so silently without falling through to any alternative. The fix raises the plausibility threshold to `> 10` to reject obviously wrong values, and falls through to OS-native detection.
+
+**2. `except AttributeError` is too narrow.**
+On some SDL backends (particularly SDL2 on Linux with Wayland, or older SDL1 builds), the function exists but `pygame.display.get_current_refresh_rate()` raises `pygame.error` instead of `AttributeError`. The original code only caught `AttributeError`, so `pygame.error` propagated as an unhandled exception and crashed the program before any stimulus was shown. The fix catches `(AttributeError, pygame.error)`.
+
+**3. The warning was unreachable.**
+The user's edit added a warning inside `except AttributeError`. However, the `if detected > 0` branch above it assigned `refresh_rate` before any exception was raised, so the warning only fires if `AttributeError` is raised — not if `detected == 0`, which is the more common failure mode. The restructured code emits a warning if and only if *all three tiers* fail to produce a plausible rate.
+
+### 10.3 Three-Tier Detection Strategy
+
+`run()` attempts three sources in order, stopping at the first plausible result (> 10 Hz):
+
+| Tier | Method | Conditions |
+|---|---|---|
+| **1** | `pygame.display.get_current_refresh_rate()` | pygame ≥ 2.1, driver populates SDL display mode |
+| **2** | `_detect_refresh_rate_os()` — OS-native query | No extra dependencies; platform-specific (see below) |
+| **3** | `self.fps` (fallback) | Always available; a System Warning is printed |
+
+**`_detect_refresh_rate_os()` implementation by platform:**
+
+*Windows* — `ctypes` + Win32 GDI:
+```python
+hdc  = ctypes.windll.user32.GetDC(None)     # DC for primary display
+rate = ctypes.windll.gdi32.GetDeviceCaps(hdc, 116)  # VREFRESH = 116
+```
+`GetDeviceCaps(VREFRESH)` reads the value the graphics driver uses for the active display mode. This is more reliable than `EnumDisplaySettings.dmDisplayFrequency`, which can return `0` or `1` on some hardware.
+
+*Linux (X11)* — `xrandr` subprocess:
+```
+xrandr output, parsed for the active mode marker (*):
+  1920x1080   144.00*+  120.00   60.00
+             ^^^^^^^^ extracted
+```
+Returns `None` on Wayland sessions where `xrandr` is unavailable or reports no connected output.
+
+*macOS* — `system_profiler SPDisplaysDataType` subprocess:
+```
+Refresh Rate: 60 Hz          ← Intel/AMD Macs
+Resolution: 2560 x 1600 @ 120.00Hz  ← Apple Silicon
+```
+Two regex patterns are tried in order to cover both output formats. Typical query latency is 0.5–2 seconds; this is acceptable at startup.
+
+All exceptions inside `_detect_refresh_rate_os()` are silently caught and return `None`, so the tier-3 fallback is always reached cleanly.
+
+### 10.4 Vsync and the Clock-Tick Bug
+
+The original render loop called `clock.tick(fps)` at the **top** of each iteration, before drawing:
+
+```python
+# ❌ original — double-paces when vsync is active
+while True:
+    clock.tick(fps)       # sleep until next frame target
+    ...
+    pygame.display.flip() # ALSO blocks on retrace if vsync=1
+```
+
+When vsync is enabled, `display.flip()` already blocks for exactly one retrace interval (~6.94 ms at 144 Hz). Adding `clock.tick()` on top introduces a second sleep, causing the loop to take approximately *two* frame intervals per iteration — halving the effective frame rate and therefore halving all flicker frequencies.
+
+The corrected loop:
+1. Opens the display with `vsync=1` (falling back to no-vsync on old pygame/drivers).
+2. Moves `clock.tick(fps)` to the **bottom**, where it is **only called when `vsync_ok` is False**.
+3. Moves `stimulus.update()` to **after** `display.flip()`, so frame counters increment only after the frame is physically on-screen.
+
+```python
+# ✅ corrected
+while True:
+    ...draw...
+    pygame.display.flip()     # blocks on retrace when vsync_ok=True
+    for s in stimuli:
+        s.update()            # increment only after frame is shown
+    if not vsync_ok:
+        clock.tick(fps)       # software pacing only as fallback
+```
+
+A TARGET_FPS mismatch warning is also emitted if the detected hardware rate and `self.fps` differ by more than 1 Hz, since this would cause the software-pacing fallback to deliver the wrong frame rate.
+
+### 10.5 Alternative Frameworks
+
+pygame/SDL2 is a practical choice for most laboratory SSVEP work, but several limitations exist for demanding timing applications. The table below summarises the most relevant alternatives.
+
+| Framework | Vsync mechanism | Refresh detection | OS support | Notes |
+|---|---|---|---|---|
+| **pygame 2.x / SDL2** | `set_mode(..., vsync=1)` | `get_current_refresh_rate()` — unreliable on some drivers (see above) | Win / Linux / macOS | Used by this tool. Lowest barrier to entry. |
+| **PsychoPy** | Uses pyglet or GLFW internally; wraps flip with frame-accurate timing and photodiode-verified onset detection | `Window.getActualFrameRate()` — measures empirically over N frames | Win / Linux / macOS | Purpose-built for psychophysics. Best timing guarantees. High-level SSVEP stimulus classes exist. Recommended for publication-grade experiments. |
+| **Pyglet** | `pyglet.canvas.Display` + `pyglet.clock.schedule_interval`; vsync via `config.double_buffer` | No built-in rate query; use OS-native or empirical measurement | Win / Linux / macOS | Direct OpenGL access; lower-level than PsychoPy. More predictable than pygame/SDL for frame pacing. |
+| **GLFW (via pyglfw)** | `glfwSwapInterval(1)` — standard OpenGL swap-interval vsync; highly reliable | `glfwGetVideoMode().refresh_rate` — reads from GLFW directly | Win / Linux / macOS | Most reliable vsync of any Python option. Requires manual OpenGL setup (no built-in 2D sprite system). |
+| **OpenGL + SFML (PySFML)** | `window.vertical_sync_enabled = True` | `VideoMode.desktop_mode.bpp` — limited; use OS-native | Win / Linux / macOS | Less common in Python lab code; mature C++ backing. |
+| **Expyriment** | Built on pygame; adds millisecond-precision stimulus onset timestamps | Inherits pygame limitations | Win / Linux / macOS | Designed for cognitive experiments; simpler API than PsychoPy for basic paradigms. |
+
+**Recommendation for high-precision SSVEP research:** PsychoPy provides the most complete timing infrastructure, including empirical frame-rate measurement, flip-timestamp logging, and built-in support for `SSVEP`-type stimuli. Its `Window.flip()` method records the actual timestamp of each retrace and provides a `frameIntervals` buffer for post-hoc jitter analysis. For production EEG/BCI systems, PsychoPy with a photodiode verification channel is the preferred standard.
+
+For applications where pygame is sufficient, the fixes in this tool (three-tier detection, vsync=1, corrected clock.tick placement, flip-then-update ordering) bring it into alignment with PsychoPy's frame pacing behaviour on supported drivers.
+
+---
+
+## 11. Methodological Considerations
+
+**Monitor synchronisation.** Accurate flicker timing depends on the render loop advancing exactly one frame per display refresh. `run()` requests hardware vsync (`vsync=1`) so that `display.flip()` blocks on the vertical retrace signal; this is more reliable than software sleep-based pacing. For studies with strict timing requirements, an external photodiode placed at a corner of the screen and recorded on a parallel EEG channel remains the gold standard for verifying onset accuracy.
 
 **Duty cycle.** Both scheduling modes produce a 50% duty cycle (equal ON and OFF durations). This is the standard duty cycle used in SSVEP research and the value used by Nakanishi et al. (2014).
 
@@ -655,17 +774,17 @@ A warnings section is only shown when one or more `FRAME_COUNT` stimuli deviate 
 
 **Greyscale conversion.** Conversion uses ITU-R BT.601 luminance coefficients (R: 0.299, G: 0.587, B: 0.114), which are standard for standard-definition video content. These coefficients are appropriate for most laboratory monitor gamuts. The alpha channel (transparency) of the source image is preserved through both greyscale conversion and negative generation.
 
-**Image processing performance.** Both `_to_greyscale()` and `_to_negative()` are executed once at stimulus construction, not per frame. With numpy installed, both complete in well under one millisecond for typical stimulus sizes. Without numpy, a pure-pygame pixel loop is used; for a 200×200 image this takes approximately 0.2–0.8 seconds depending on hardware, which is acceptable at startup.
+**Image processing performance.** `_to_greyscale()`, `_to_negative()`, and `_to_pixelated()` are executed once at stimulus construction, not per frame. With numpy installed, both the greyscale and negative operations complete in well under one millisecond for typical stimulus sizes. Without numpy, a pure-pygame pixel loop is used; for a 200×200 image this takes approximately 0.2–0.8 seconds, which is acceptable at startup.
+
+**Pixelation.** The `pixelate` parameter applies a mosaic effect by downscaling the image to `ceil(w / block_size) × ceil(h / block_size)` and upscaling back with nearest-neighbour interpolation. Because pixelation is applied before negative generation, both the ON and OFF surfaces share identical block boundaries — only the colour content alternates, not the spatial structure.
 
 **Phase parameter.** The `phase` parameter shifts the start of the ON half-cycle by a fraction of one full period, defined in normalised units (0.0–1.0, where 1.0 = one full cycle). A phase of `0.25` corresponds to a 90° shift. This parameter is only active in `APPROXIMATION` mode and is silently ignored in `FRAME_COUNT` mode.
-
-**Pixelation.** The `pixelate` parameter applies a mosaic effect by downscaling the image to `ceil(w / block_size) × ceil(h / block_size)` and then upscaling back with nearest-neighbour interpolation. This intentionally degrades spatial resolution, reducing high-frequency spatial content in the stimulus. Because pixelation is applied before negative generation, both the ON and OFF phase surfaces share identical block boundaries, so the mosaic grid is perceptually stable across the entire flicker cycle — only the colour content alternates, not the spatial structure. Larger block sizes reduce spatial information more aggressively. A block size of 1 or `None` disables the effect entirely.
 
 **Number of stimuli.** There is no hard upper limit on the number of simultaneous stimuli. Performance may degrade with very large images or many stimuli on constrained hardware; all stimuli are rendered synchronously within a single frame.
 
 ---
 
-## 11. Citation
+## 12. Citation
 
 If this software is used in published research, please cite the methodological paper on which the approximation scheduling mode is based:
 
@@ -681,4 +800,4 @@ For phase-coded paradigms, the following may also be relevant:
 
 ---
 
-*Documentation version: 4.0. Corresponds to `blinking_stimuli.py` with `FlickerType`, `ColorMode`, auto-sizing startup diagnostics, `QuickLayout` factory class, and `pixelate` parameter.*
+*Documentation version: 5.0. Corresponds to `blinking_stimuli.py` with `FlickerType`, `ColorMode`, auto-sizing startup diagnostics, `QuickLayout` factory, `pixelate` parameter, three-tier refresh-rate detection, vsync support, and corrected render-loop frame ordering.*

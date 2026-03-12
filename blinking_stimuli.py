@@ -40,8 +40,10 @@ Usage
 """
 
 import sys
+import re
 import math
 import enum
+import subprocess
 import pygame
 
 
@@ -65,6 +67,77 @@ class ColorMode(enum.Enum):
     """Selects whether the image is rendered in full colour or greyscale."""
     COLOUR     = "Colour"
     GREYSCALE  = "Greyscale"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Refresh-rate detection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _detect_refresh_rate_os() -> float | None:
+    """
+    Query the primary display's vertical refresh rate using OS-native APIs.
+
+    No third-party packages are required.  Returns the detected rate in Hz, or
+    ``None`` if the query fails or the result is not plausible (≤ 10 Hz).
+
+    Platform support
+    ────────────────
+    Windows  ctypes + ``GetDeviceCaps(hdc, VREFRESH)``
+             More reliable than ``EnumDisplaySettings`` because it reads the
+             value the graphics driver actually uses for the current mode,
+             whereas ``EnumDisplaySettings.dmDisplayFrequency`` may return 0
+             or 1 on some hardware/driver combinations.
+
+    Linux    ``xrandr`` subprocess (X11 only).
+             Parses the line containing ``*`` (active mode), e.g.
+             ``1920x1080   144.00*+``.  Returns ``None`` on Wayland sessions
+             where ``xrandr`` is unavailable or reports no active output.
+
+    macOS    ``system_profiler SPDisplaysDataType`` subprocess.
+             Matches ``Refresh Rate: 60 Hz`` or ``@ 60.00Hz`` patterns.
+             Typical latency is 0.5–2 s; acceptable at startup only.
+    """
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            VREFRESH = 116                              # GDI GetDeviceCaps index
+            hdc = ctypes.windll.user32.GetDC(None)     # DC for the primary display
+            if hdc:
+                rate = ctypes.windll.gdi32.GetDeviceCaps(hdc, VREFRESH)
+                ctypes.windll.user32.ReleaseDC(None, hdc)
+                if rate > 10:
+                    return float(rate)
+
+        elif sys.platform.startswith("linux"):
+            out = subprocess.check_output(
+                ["xrandr"], stderr=subprocess.DEVNULL, timeout=3
+            ).decode("utf-8", errors="replace")
+            # Active mode is marked with '*', e.g. "  1920x1080   144.00*+"
+            m = re.search(r"(\d+\.\d+)\s*\*", out)
+            if m:
+                rate = float(m.group(1))
+                if rate > 10:
+                    return rate
+
+        elif sys.platform == "darwin":
+            out = subprocess.check_output(
+                ["system_profiler", "SPDisplaysDataType"],
+                stderr=subprocess.DEVNULL, timeout=8,
+            ).decode("utf-8", errors="replace")
+            for pattern in (
+                r"Refresh Rate:\s+(\d+(?:\.\d+)?)\s+Hz",   # Intel/AMD Macs
+                r"@\s*(\d+(?:\.\d+)?)\s*[Hh]z",            # Apple Silicon
+            ):
+                m = re.search(pattern, out)
+                if m:
+                    rate = float(m.group(1))
+                    if rate > 10:
+                        return rate
+
+    except Exception:
+        pass
+
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -134,46 +207,6 @@ def _to_negative(surf: pygame.Surface) -> pygame.Surface:
     return out
 
 
-def _to_pixelated(surf: pygame.Surface, block_size: int) -> pygame.Surface:
-    """
-    Return a pixelated copy of *surf* at the same display size.
-
-    The image is downscaled to ``ceil(w / block_size) × ceil(h / block_size)``
-    using bilinear smoothing (so each block correctly averages its source
-    pixels), then upscaled back to the original size using nearest-neighbour
-    scaling (so block boundaries remain hard-edged).
-
-    Alpha channel is preserved because both transform steps operate on a
-    surface that already carries alpha information.
-
-    Parameters
-    ----------
-    surf       : pygame.Surface
-        Source surface.  May have per-pixel alpha (SRCALPHA).
-    block_size : int
-        Side length of each output pixel block in display pixels.
-        1 → no change.  8 → 8×8 pixel blocks.
-
-    Returns
-    -------
-    pygame.Surface
-        A new surface of the same size as *surf* with the pixelated effect
-        applied.
-    """
-    if block_size <= 1:
-        return surf.copy()
-
-    w, h       = surf.get_size()
-    small_w    = max(1, math.ceil(w / block_size))
-    small_h    = max(1, math.ceil(h / block_size))
-
-    # Downscale with smoothscale: correctly averages colours within each block.
-    small = pygame.transform.smoothscale(surf, (small_w, small_h))
-
-    # Upscale with scale (nearest-neighbour): creates hard-edged blocks.
-    return pygame.transform.scale(small, (w, h))
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Stimulus
 # ──────────────────────────────────────────────────────────────────────────────
@@ -204,14 +237,6 @@ class Stimulus:
         Initial phase offset in [0.0, 1.0).  0.5 starts in the OFF half-cycle.
         Useful for phase-coded SSVEP paradigms.
         Only applied in APPROXIMATION mode; ignored in FRAME_COUNT mode.
-    pixelate     : int | None
-        Block size in pixels for a pixelation effect applied before flicker
-        generation.  Each ``block_size × block_size`` region of the source
-        image is collapsed to a single uniform colour, producing a mosaic
-        appearance.  ``None`` or ``1`` disables pixelation (default: ``None``).
-        The effect is baked in at construction time, so both the ON and OFF
-        surfaces (including the colour-negative for ON_NEGATIVE) are pixelated
-        consistently with no per-frame cost.
     """
 
     def __init__(
@@ -224,7 +249,6 @@ class Stimulus:
         flicker_type: FlickerType = FlickerType.ON_OFF,
         color_mode: ColorMode = ColorMode.COLOUR,
         phase: float = 0.0,
-        pixelate: int = None,
     ):
         self.position     = position
         self.target_freq  = target_freq
@@ -232,7 +256,6 @@ class Stimulus:
         self.flicker_type = flicker_type
         self.color_mode   = color_mode
         self.phase        = phase % 1.0
-        self.pixelate     = int(pixelate) if (pixelate is not None and int(pixelate) > 1) else None
 
         # ── load and process image ───────────────────────────────────────────
         raw = pygame.image.load(image_path).convert_alpha()
@@ -241,9 +264,6 @@ class Stimulus:
 
         if color_mode is ColorMode.GREYSCALE:
             raw = _to_greyscale(raw)
-
-        if self.pixelate is not None:
-            raw = _to_pixelated(raw, self.pixelate)
 
         self._image_on  = raw
         self._image_off = _to_negative(raw) if flicker_type is FlickerType.ON_NEGATIVE else None
@@ -353,11 +373,16 @@ class StimulusDisplay:
 
     # ── print helpers ────────────────────────────────────────────────────────
 
-    def _print_startup(self, refresh_rate: float, warnings: list) -> None:
+    def _print_startup(self, refresh_rate: float, vsync_ok: bool,
+                       warnings: list) -> None:
         """Print a formatted, auto-sizing configuration table to stdout."""
 
         SEP = "  "   # column separator (two spaces)
         PAD = 2      # inner left/right padding inside the box borders
+
+        # ── split warnings into system-level and per-stimulus ────────────────
+        sys_warnings     = [(idx, msg) for idx, msg in warnings if idx is None]
+        stim_warnings    = [(idx, msg) for idx, msg in warnings if idx is not None]
 
         # ── build table cell data ────────────────────────────────────────────
         headers = [
@@ -373,7 +398,7 @@ class StimulusDisplay:
                 f"{s.actual_freq:.4f}",
                 s.flicker_type.value,
                 s.color_mode.value,
-                str(s.pixelate) if s.pixelate is not None else "—",
+                str(px) if (px := getattr(s, "pixelate", None)) is not None else "—",
                 f"{s.phase:.3f}",
             ]
             for i, s in enumerate(self.stimuli, 1)
@@ -390,11 +415,13 @@ class StimulusDisplay:
             return SEP.join(cell.ljust(col_w[j]) for j, cell in enumerate(cells))
 
         # ── determine box inner width ────────────────────────────────────────
-        # Must accommodate: table rows, info lines, and the title
+        vsync_str  = "enabled (display.flip blocks on retrace)" if vsync_ok \
+                     else "not available — using clock.tick() fallback"
         info_lines = [
-            ("Display refresh rate",  f"{refresh_rate:.1f} Hz"),
+            ("Display refresh rate",    f"{refresh_rate:.1f} Hz"),
+            ("Vsync",                   vsync_str),
             ("Background colour (RGB)", str(self.bg_color)),
-            ("Fullscreen",            str(self.fullscreen)),
+            ("Fullscreen",              str(self.fullscreen)),
         ]
         info_label_w = max(len(label) for label, _ in info_lines)
         info_strs    = [f"{lbl:<{info_label_w}}  {val}" for lbl, val in info_lines]
@@ -422,6 +449,27 @@ class StimulusDisplay:
         def divider_line() -> str:
             return f"│{' ' * PAD}{'─' * inner_w}{' ' * PAD}│"
 
+        def _wrap_warning(header: str, msg: str) -> list:
+            """Word-wrap *msg* so each line fits inside the box."""
+            prefix_w = len(header)
+            wrap_w   = inner_w - prefix_w
+            words, out_lines, line = msg.split(), [], ""
+            for word in words:
+                candidate = (line + " " + word).strip()
+                if len(candidate) <= wrap_w:
+                    line = candidate
+                else:
+                    if line:
+                        out_lines.append(line)
+                    line = word
+            if line:
+                out_lines.append(line)
+            indent = " " * prefix_w
+            result = []
+            for k, ln in enumerate(out_lines):
+                result.append(bline((header if k == 0 else indent) + ln))
+            return result
+
         # ── print ────────────────────────────────────────────────────────────
         print()
         print(hline("┌", "─", "┐"))
@@ -435,29 +483,25 @@ class StimulusDisplay:
         for row in rows:
             print(bline(fmt_row(row)))
 
-        if warnings:
+        # ── system warnings (idx = None) — shown before stimulus warnings ────
+        if sys_warnings:
             print(hline("├", "─", "┤"))
-            print(bline("Warnings", "^"))
+            print(bline("System Warnings", "^"))
             print(divider_line())
-            prefix_w  = max(len(f"Stimulus {idx}: ") for idx, _ in warnings)
-            wrap_w    = inner_w - prefix_w
-            for idx, msg in warnings:
-                prefix = f"Stimulus {idx}: ".ljust(prefix_w)
-                indent = " " * prefix_w
-                # word-wrap the message to fit within the box
-                words, out_lines, line = msg.split(), [], ""
-                for word in words:
-                    candidate = (line + " " + word).strip()
-                    if len(candidate) <= wrap_w:
-                        line = candidate
-                    else:
-                        if line:
-                            out_lines.append(line)
-                        line = word
-                if line:
-                    out_lines.append(line)
-                for k, ln in enumerate(out_lines):
-                    print(bline((prefix if k == 0 else indent) + ln))
+            for _, msg in sys_warnings:
+                for line in _wrap_warning("", msg):
+                    print(line)
+
+        # ── per-stimulus warnings ─────────────────────────────────────────────
+        if stim_warnings:
+            print(hline("├", "─", "┤"))
+            print(bline("Stimulus Warnings", "^"))
+            print(divider_line())
+            prefix_w = max(len(f"Stimulus {idx}: ") for idx, _ in stim_warnings)
+            for idx, msg in stim_warnings:
+                header = f"Stimulus {idx}: ".ljust(prefix_w)
+                for line in _wrap_warning(header, msg):
+                    print(line)
 
         print(hline("└", "─", "┘"))
         print()
@@ -468,43 +512,103 @@ class StimulusDisplay:
         """Open the display, configure stimuli, and enter the render loop."""
         pygame.init()
 
-        # Reuse an existing surface (opened before stimuli were built) or create
-        # a new one.
+        # ── open the display ─────────────────────────────────────────────────
+        # Request vsync=1 so that display.flip() blocks until the monitor's
+        # next vertical retrace.  When vsync is active the flip itself paces
+        # the loop to exactly one refresh interval — clock.tick() must NOT
+        # be called (it would add a redundant sleep on top of the retrace wait,
+        # causing every-other-flip to be skipped and halving effective fps).
+        # If vsync=1 is unavailable (old pygame / SDL / driver), we fall back
+        # to software pacing via clock.tick(fps) only.
+        flags    = pygame.FULLSCREEN | pygame.HWSURFACE | pygame.DOUBLEBUF \
+                   if self.fullscreen else pygame.DOUBLEBUF
+        size     = (0, 0) if self.fullscreen else (1280, 720)
+        vsync_ok = False
+
+        # Reuse a surface that was opened before stimuli were built (common
+        # pattern in the entry-point block).
         screen = pygame.display.get_surface()
         if screen is None:
-            flags = (pygame.FULLSCREEN | pygame.HWSURFACE | pygame.DOUBLEBUF
-                     if self.fullscreen else 0)
-            if self.fullscreen:
-                screen = pygame.display.set_mode((0, 0), flags)
-            else:
-                screen = pygame.display.set_mode((1280, 720), flags)
+            try:
+                screen   = pygame.display.set_mode(size, flags, vsync=1)
+                vsync_ok = True
+            except (TypeError, pygame.error):
+                # pygame < 2.0 or driver rejects vsync flag
+                screen = pygame.display.set_mode(size, flags)
 
         pygame.display.set_caption("Blinking Stimuli")
         pygame.mouse.set_visible(False)
 
-        # Detect the display refresh rate; fall back to the requested fps.
-        refresh_rate = float(self.fps)
+        # ── refresh-rate detection ────────────────────────────────────────────
+        # Three-tier strategy (highest confidence first):
+        #
+        #   Tier 1 — pygame.display.get_current_refresh_rate()  (pygame ≥ 2.1)
+        #             Can silently return 0 when SDL/driver doesn't populate
+        #             the field; requires both a "> 0" AND a "> 10" plausibility
+        #             guard.  Can also raise pygame.error (not just AttributeError)
+        #             on some backends — both exceptions must be caught.
+        #
+        #   Tier 2 — OS-native query via _detect_refresh_rate_os()
+        #             Uses ctypes/GDI on Windows, xrandr subprocess on Linux,
+        #             system_profiler on macOS.  No third-party dependencies.
+        #
+        #   Tier 3 — Fall back to self.fps with a visible warning.
+        warnings     = []
+        refresh_rate = None
+
+        # — Tier 1 —
         try:
             detected = pygame.display.get_current_refresh_rate()   # pygame ≥ 2.1
-            if detected > 0:
+            if detected > 10:                # > 0 is insufficient; 0 = "unknown"
                 refresh_rate = float(detected)
-        except AttributeError:
+        except (AttributeError, pygame.error):
             pass
 
-        # Configure each stimulus and collect any warnings
-        warnings = []
+        # — Tier 2 —
+        if refresh_rate is None:
+            refresh_rate = _detect_refresh_rate_os()
+
+        # — Tier 3 —
+        if refresh_rate is None:
+            refresh_rate = float(self.fps)
+            warnings.append((
+                None,
+                f"Display refresh rate could not be detected automatically "
+                f"(pygame API unavailable or returned 0; OS-native query also "
+                f"failed). Using TARGET_FPS = {self.fps} Hz. Verify this "
+                f"matches your monitor's native refresh rate.",
+            ))
+
+        # Warn if TARGET_FPS doesn't match the hardware rate.  The loop runs at
+        # self.fps (via clock.tick), but stimuli were configured with
+        # refresh_rate — a mismatch scales all flicker frequencies incorrectly.
+        if abs(refresh_rate - self.fps) > 1.0:
+            warnings.append((
+                None,
+                f"TARGET_FPS ({self.fps} Hz) does not match the detected "
+                f"display refresh rate ({refresh_rate:.1f} Hz). All flicker "
+                f"frequencies will be miscalculated. Set TARGET_FPS = "
+                f"{int(round(refresh_rate))} to match your monitor.",
+            ))
+            # Use self.fps as the effective scheduling rate so it at least
+            # matches what clock.tick actually delivers.
+            refresh_rate = float(self.fps)
+
+        # ── configure stimuli ────────────────────────────────────────────────
         for i, s in enumerate(self.stimuli, 1):
             msg = s._configure(refresh_rate)
             if msg:
                 warnings.append((i, msg))
 
-        self._print_startup(refresh_rate, warnings)
+        self._print_startup(refresh_rate, vsync_ok, warnings)
 
+        # ── render loop ──────────────────────────────────────────────────────
+        # When vsync is active, display.flip() already blocks for one refresh
+        # interval — clock.tick() must be skipped to avoid double-pacing.
+        # When vsync is absent, clock.tick(fps) is the only pacing mechanism.
         clock = pygame.time.Clock()
 
         while True:
-            clock.tick(self.fps)
-
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit()
@@ -516,9 +620,16 @@ class StimulusDisplay:
             screen.fill(self.bg_color)
             for stimulus in self.stimuli:
                 stimulus.draw(screen)
+
+            # flip() blocks on vsync when vsync_ok=True, so frame counters are
+            # incremented only after the rendered frame is physically on-screen.
+            pygame.display.flip()
+
+            for stimulus in self.stimuli:
                 stimulus.update()
 
-            pygame.display.flip()
+            if not vsync_ok:
+                clock.tick(self.fps)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -555,7 +666,7 @@ class QuickLayout:
 
     @staticmethod
     def _make(image_paths, positions, size, target_freqs, phases,
-              flicker_mode, flicker_type, color_mode, pixelate) -> list:
+              flicker_mode, flicker_type, color_mode) -> list:
         """Construct a Stimulus for each position with broadcast parameters."""
         stimuli = []
         for i, pos in enumerate(positions):
@@ -568,7 +679,6 @@ class QuickLayout:
                 flicker_type = QuickLayout._get(flicker_type, i),
                 color_mode   = QuickLayout._get(color_mode,   i),
                 phase        = QuickLayout._get(phases,       i),
-                pixelate     = QuickLayout._get(pixelate,     i),
             ))
         return stimuli
 
@@ -588,7 +698,6 @@ class QuickLayout:
         flicker_type             = FlickerType.ON_OFF,
         color_mode               = ColorMode.COLOUR,
         phase                    = 0.0,
-        pixelate                 = None,
     ) -> list:
         """
         Arrange stimuli in a regular *rows* × *cols* rectangular grid.
@@ -611,9 +720,6 @@ class QuickLayout:
         flicker_mode, flicker_type, color_mode, phase
             Passed directly to each ``Stimulus``.  All accept a scalar
             (shared by every stimulus) or a list (cycled).
-        pixelate    : int or None or list[int | None]
-            Block size for pixelation in pixels.  ``None`` disables.
-            Cycled if a list.
 
         Returns
         -------
@@ -639,7 +745,7 @@ class QuickLayout:
         ]
         return QuickLayout._make(image_paths, positions, size,
                                  target_freq, phase,
-                                 flicker_mode, flicker_type, color_mode, pixelate)
+                                 flicker_mode, flicker_type, color_mode)
 
     # ── circle ────────────────────────────────────────────────────────────────
 
@@ -658,7 +764,6 @@ class QuickLayout:
         flicker_type             = FlickerType.ON_OFF,
         color_mode               = ColorMode.COLOUR,
         phase                    = 0.0,
-        pixelate                 = None,
     ) -> list:
         """
         Arrange *n* stimuli equally spaced around a circle.
@@ -685,9 +790,6 @@ class QuickLayout:
         flicker_mode, flicker_type, color_mode, phase
             Passed directly to each ``Stimulus``.  All accept a scalar
             or a list (cycled).
-        pixelate     : int or None or list[int | None]
-            Block size for pixelation in pixels.  ``None`` disables.
-            Cycled if a list.
 
         Returns
         -------
@@ -713,7 +815,7 @@ class QuickLayout:
             ))
         return QuickLayout._make(image_paths, positions, size,
                                  target_freq, phase,
-                                 flicker_mode, flicker_type, color_mode, pixelate)
+                                 flicker_mode, flicker_type, color_mode)
 
     # ── checkerboard ─────────────────────────────────────────────────────────
 
@@ -734,8 +836,6 @@ class QuickLayout:
         color_mode               = ColorMode.COLOUR,
         phase_a                  = 0.0,
         phase_b                  = 0.0,
-        pixelate_a               = None,
-        pixelate_b               = None,
     ) -> list:
         """
         Arrange stimuli in a *rows* × *cols* grid where cells alternate between
@@ -770,10 +870,6 @@ class QuickLayout:
             Shared stimulus parameters applied to all stimuli.
         phase_a, phase_b : float or list[float]
             Phase offsets for group A and group B.
-        pixelate_a, pixelate_b : int or None or list[int | None]
-            Block sizes for pixelation for group A and group B respectively.
-            ``None`` disables pixelation for that group.  Cycled within each
-            group if lists are provided.
 
         Returns
         -------
@@ -806,13 +902,11 @@ class QuickLayout:
                     img   = QuickLayout._get(image_paths_a, idx_a)
                     freq  = QuickLayout._get(target_freq_a, idx_a)
                     ph    = QuickLayout._get(phase_a,       idx_a)
-                    pix   = QuickLayout._get(pixelate_a,    idx_a)
                     idx_a += 1
                 else:
                     img   = QuickLayout._get(image_paths_b, idx_b)
                     freq  = QuickLayout._get(target_freq_b, idx_b)
                     ph    = QuickLayout._get(phase_b,       idx_b)
-                    pix   = QuickLayout._get(pixelate_b,    idx_b)
                     idx_b += 1
 
                 stimuli.append(Stimulus(
@@ -824,7 +918,6 @@ class QuickLayout:
                     flicker_type = QuickLayout._get(flicker_type, len(stimuli)),
                     color_mode   = QuickLayout._get(color_mode,   len(stimuli)),
                     phase        = ph,
-                    pixelate     = pix,
                 ))
 
         return stimuli
@@ -914,33 +1007,29 @@ if __name__ == "__main__":
     #           flicker_type = FlickerType.ON_NEGATIVE,
     #           color_mode   = ColorMode.GREYSCALE,
     #           phase        = 0.0,
-    #           pixelate     = 8,      # 8×8 px blocks; None to disable
     #       ),
     #   ]
     #
     # Option B — QuickLayout factory (pick one):
     #
-    #   # 2 × 4 grid, one frequency per cell, 8-pixel mosaic
+    #   # 2 × 4 grid, one frequency per cell
     #   STIMULI = QuickLayout.grid(
     #       "target.png", W, H, rows=2, cols=4,
     #       target_freq=[8, 9, 10, 11, 12, 13, 14, 15],
     #       flicker_type=FlickerType.ON_NEGATIVE,
-    #       pixelate=8,
     #   )
     #
-    #   # 8 stimuli in a circle, varying pixelation per target
+    #   # 8 stimuli equally spaced around a circle
     #   STIMULI = QuickLayout.circle(
     #       "target.png", W, H, n=8,
     #       target_freq=[8, 9, 10, 11, 12, 13, 14, 15],
     #       radius=0.38,
-    #       pixelate=[None, 4, 8, 16, None, 4, 8, 16],
     #   )
     #
-    #   # 3 × 4 checkerboard — pixelated A group, sharp B group
+    #   # 3 × 4 checkerboard — two interleaved groups at different frequencies
     #   STIMULI = QuickLayout.checkerboard(
     #       "face.png", "house.png", W, H, rows=3, cols=4,
     #       target_freq_a=10.0, target_freq_b=12.0,
-    #       pixelate_a=10, pixelate_b=None,
     #   )
     #
     # ─── FREQUENCY GUIDANCE ──────────────────────────────────────────────────
@@ -984,9 +1073,7 @@ if __name__ == "__main__":
     paths_b  = [_make_placeholder((80, 120, 220), "B")]
 
     if DEMO_LAYOUT == "grid":
-        # 2 × 4 grid, 8–15 Hz, approximation mode, on/negative flicker.
-        # Pixelation escalates across columns (None, 4, 8, 16) so all four
-        # block sizes are visible side-by-side in each row.
+        # 2 × 4 grid, 8–15 Hz, approximation mode, on/negative flicker
         STIMULI = QuickLayout.grid(
             image_paths  = paths_8,
             W=W, H=H,
@@ -995,7 +1082,6 @@ if __name__ == "__main__":
             target_freq  = freqs_8,
             flicker_type = FlickerType.ON_NEGATIVE,
             color_mode   = ColorMode.COLOUR,
-            pixelate     = [None, 4, 8, 16, None, 4, 8, 16],
         )
 
     elif DEMO_LAYOUT == "circle":
