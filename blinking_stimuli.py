@@ -251,6 +251,8 @@ class Stimulus:
         phase: float = 0.0,
     ):
         self.position     = position
+        # Preserve the original image path for external diagnostics
+        self.image_path   = image_path
         self.target_freq  = target_freq
         self.flicker_mode = flicker_mode
         self.flicker_type = flicker_type
@@ -920,14 +922,16 @@ class QuickLayout:
                     ph    = QuickLayout._get(phase_b,       idx_b)
                     idx_b += 1
 
+                i = r * cols + c
+
                 stimuli.append(Stimulus(
                     image_path   = img,
                     position     = pos,
                     size         = size,
                     target_freq  = freq,
-                    flicker_mode = QuickLayout._get(flicker_mode, len(stimuli)),
-                    flicker_type = QuickLayout._get(flicker_type, len(stimuli)),
-                    color_mode   = QuickLayout._get(color_mode,   len(stimuli)),
+                    flicker_mode = QuickLayout._get(flicker_mode, i),
+                    flicker_type = QuickLayout._get(flicker_type, i),
+                    color_mode   = QuickLayout._get(color_mode,   i),
                     phase        = ph,
                 ))
 

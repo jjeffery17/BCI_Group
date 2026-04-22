@@ -588,9 +588,43 @@ class PsychoPyStimDriver:
         """
         import numpy as np
         import pygame
+        import tempfile
+        import time
+        from pathlib import Path
+
         arr = pygame.surfarray.array3d(surf)   # (W, H, 3)
-        arr = arr.transpose(1, 0, 2).astype(np.float32)  # (H, W, 3)
-        return arr / 127.5 - 1.0
+        # Transpose to (H, W, 3)
+        arr = arr.transpose(1, 0, 2)
+
+        # Convert to float32 in range [-1, 1] as required by PsychoPy for
+        # numpy texture arrays (black=-1, white=+1).
+        arr_f = arr.astype(np.float32) / 127.5 - 1.0
+
+        # Diagnostics: print concise array statistics (float range)
+        try:
+            mn = float(arr_f.min())
+            mx = float(arr_f.max())
+            mean = float(arr_f.mean())
+        except Exception:
+            mn = mx = mean = None
+        print(
+            f"[PsychoPyStimDriver] _surface_to_array: shape={arr_f.shape} dtype={arr_f.dtype} min={mn:.3f} max={mx:.3f} mean={mean:.3f}",
+            flush=True,
+        )
+
+        # Save a uint8 preview for offline inspection (Pillow optional).
+        try:
+            from PIL import Image
+            tmpdir = Path(tempfile.gettempdir()) / "ssvep_debug"
+            tmpdir.mkdir(exist_ok=True)
+            preview = ((arr_f + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+            fname = tmpdir / f"stim_preview_{int(time.time()*1000)}.png"
+            Image.fromarray(preview).save(str(fname))
+            print(f"[PsychoPyStimDriver] saved preview → {fname}", flush=True)
+        except Exception:
+            pass
+
+        return arr_f
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -734,6 +768,23 @@ class SSVEPExperiment:
         # ── build stimuli via blinking_stimuli QuickLayout ───────────────────
         print(f"[SSVEPExperiment] Building stimuli for W={W}, H={H}", flush=True)
         self._stimuli = self._build_stimuli(W, H)
+        # Diagnostics: print image path and target frequency for each stimulus
+        try:
+            print("[SSVEPExperiment] Diagnostics: stimulus image paths and target freqs:", flush=True)
+            for i, s in enumerate(self._stimuli):
+                img = getattr(s, "image_path", None)
+                tf  = getattr(s, "target_freq", None)
+                fm  = getattr(s, "flicker_mode", None)
+                ft  = getattr(s, "flicker_type", None)
+                cm  = getattr(s, "color_mode", None)
+                ph  = getattr(s, "phase", None)
+                print(
+                    f"  Stim {i}: image={img}  target_freq={tf}  "
+                    f"flicker_mode={fm}  flicker_type={ft}  color_mode={cm}  phase={ph}",
+                    flush=True,
+                )
+        except Exception:
+            pass
         print(
             f"[SSVEPExperiment] {len(self._stimuli)} stimuli created "
             f"({self._cfg.layout} layout)."
@@ -913,9 +964,67 @@ class SSVEPExperiment:
                     flicker_type = cfg.flicker_type,
                     color_mode   = cfg.color_mode,
                 )
+            elif layout == "checkerboard":
+                print("[SSVEPExperiment] Creating checkerboard layout via QuickLayout.checkerboard", flush=True)
+
+                rows = cfg.layout_rows
+                cols = cfg.layout_cols
+                n_cells = rows * cols
+
+                # Always use resolved image paths
+                if len(image_paths) < 2:
+                    raise ValueError(
+                        "Checkerboard layout requires at least 2 image paths (A and B)"
+                    )
+
+                img_a = image_paths[0]
+                img_b = image_paths[1]
+
+                freqs = cfg.flicker_frequencies
+
+                # Case 1: exactly two frequencies (preferred)
+                if isinstance(freqs, (list, tuple)) and len(freqs) == 2:
+                    tf_a, tf_b = freqs
+
+                # Case 2: full grid frequencies
+                elif isinstance(freqs, (list, tuple)) and len(freqs) == n_cells:
+                    tf_a = []
+                    tf_b = []
+                    for i in range(n_cells):
+                        r = i // cols
+                        c = i % cols
+                        if (r + c) % 2 == 0:
+                            tf_a.append(freqs[i])
+                        else:
+                            tf_b.append(freqs[i])
+
+                # Case 3: single scalar frequency
+                elif isinstance(freqs, (int, float)):
+                    tf_a = tf_b = freqs
+
+                else:
+                    raise ValueError(
+                        f"Invalid flicker_frequencies for checkerboard: {freqs}\n"
+                        f"Expected: [A, B] or full list of {n_cells}"
+                    )
+
+                return QuickLayout.checkerboard(
+                    image_paths_a = img_a,
+                    image_paths_b = img_b,
+                    W = W,
+                    H = H,
+                    rows = rows,
+                    cols = cols,
+                    size = cfg.stimulus_size,
+                    target_freq_a = tf_a,
+                    target_freq_b = tf_b,
+                    flicker_mode = cfg.flicker_mode,
+                    flicker_type = cfg.flicker_type,
+                    color_mode = cfg.color_mode,
+                )
             else:
                 raise ValueError(
-                    f"Unsupported layout '{cfg.layout}'. Choose 'grid' or 'circle'."
+                    f"Unsupported layout '{cfg.layout}'. Choose 'grid', 'circle' or 'checkerboard'."
                 )
         except BaseException as exc:
             import traceback
@@ -1220,10 +1329,10 @@ if __name__ == "__main__":
         # Replace "placeholder.png" with your actual image path.
         # A colour-block placeholder will be generated automatically if the
         # file does not exist, so the experiment will still run for testing.
-        image_paths      = ["Images/WhiteSquare1.png"],
+        image_paths      = ["Images/WhiteSquare1.png", "Images/BlackSquare1.png"],
         stimulus_size    = (150, 150),
-        flicker_frequencies = [8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
-        layout           = "grid",          # "grid" or "circle"
+        flicker_frequencies = [8.0, 10.0],
+        layout           = "checkerboard",          # "grid", "checkerboard" or "circle"
         layout_rows      = 2,
         layout_cols      = 4,
 
