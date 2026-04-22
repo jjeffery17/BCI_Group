@@ -258,7 +258,18 @@ class Stimulus:
         self.phase        = phase % 1.0
 
         # ── load and process image ───────────────────────────────────────────
-        raw = pygame.image.load(image_path).convert_alpha()
+        # Load image without forcing a surface pixel-format conversion.
+        # `convert_alpha()` raises "cannot convert without pygame.display
+        # initialized" when no display is present (we run under PsychoPy's
+        # window). Only call `convert_alpha()` when the pygame display is
+        # initialised; otherwise keep the loaded surface as-is.
+        raw = pygame.image.load(image_path)
+        try:
+            if pygame.display.get_init():
+                raw = raw.convert_alpha()
+        except pygame.error:
+            # Fall back to the unconverted surface if conversion fails.
+            pass
         if size is not None:
             raw = pygame.transform.smoothscale(raw, size)
 
