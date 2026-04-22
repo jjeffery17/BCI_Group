@@ -589,10 +589,8 @@ class PsychoPyStimDriver:
         import numpy as np
         import pygame
         arr = pygame.surfarray.array3d(surf)   # (W, H, 3)
-        arr = arr.transpose(1, 0, 2).astype("float32")  # (H, W, 3)
-        # Normalize uint8 [0,255] -> float32 [-1, 1] as required by psychopy
-        arr = arr / 127.5 - 1.0
-        return arr
+        arr = arr.transpose(1, 0, 2).astype(np.float32)  # (H, W, 3)
+        return arr / 127.5 - 1.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -640,12 +638,6 @@ class SSVEPExperiment:
 
     # ── setup ─────────────────────────────────────────────────────────────────
 
-    def _safe_flip(self):
-        try:
-            self._win.flip()
-        except Exception as e:
-            print(f"[FLIP ERROR] {e}", flush=True)
-
     def setup(self) -> None:
         """Initialise display, stimuli, IDUN recorder."""
         print("[SSVEPExperiment] setup: starting", flush=True)
@@ -688,7 +680,7 @@ class SSVEPExperiment:
                 units="pix",
                 pos=(panel_x, panel_y),
                 fillColor=(-0.2, -0.2, -0.2),
-                fillColorSpace="rgb",
+                colorSpace="rgb",
                 lineColor=None,
                 opacity=0.85,
             )
@@ -786,21 +778,14 @@ class SSVEPExperiment:
                 "",
                 "Press Esc or close the window to abort",
             ]
-            print(f"[SSVEPExperiment] IDUN status: {status_msg}", flush=True)
             try:
                 self._update_status(lines)
                 self._win.clearBuffer()
                 if hasattr(self, "_status_box") and self._status_box is not None:
-                    try:
-                        self._status_box.draw()
-                    except Exception as e:
-                        print(f"[STATUS_BOX DRAW ERROR] {e}", flush=True)
+                    self._status_box.draw()
                 if hasattr(self, "_status_stim") and self._status_stim is not None:
-                    try:
-                        self._status_stim.draw()
-                    except Exception as e:
-                        print(f"[STATUS_STIM DRAW ERROR] {e}", flush=True)
-                self._safe_flip()
+                    self._status_stim.draw()
+                self._win.flip()
             except Exception:
                 pass
 
@@ -847,9 +832,6 @@ class SSVEPExperiment:
 
         while True:
             elapsed = _time.perf_counter() - start
-            if elapsed > 5.0:
-                print("[SSVEPExperiment] Frame rate measurement timeout, using fallback", flush=True)
-                return None
             if self._abort_requested():
                 raise ExperimentAborted("user aborted during refresh-rate measurement")
 
@@ -867,14 +849,8 @@ class SSVEPExperiment:
                 except Exception:
                     pass
             if hasattr(self, "_status_stim") and self._status_stim is not None:
-                try:
-                    self._status_stim.draw()
-                except Exception as e:
-                    print(f"[MEASURE STATUS DRAW ERROR] {e}", flush=True)
-            try:
-                self._safe_flip()
-            except Exception as e:
-                print(f"[MEASURE FLIP ERROR] {e}", flush=True)
+                self._status_stim.draw()
+            self._win.flip()
 
             flip_time = _time.perf_counter()
             if last_flip is not None and warmup <= 0:
@@ -1049,7 +1025,7 @@ class SSVEPExperiment:
 
             win.clearBuffer()
             self._driver.draw()
-            self._safe_flip()
+            win.flip()
             self._driver.update()
 
         trial_end = clock.getTime()
@@ -1083,7 +1059,7 @@ class SSVEPExperiment:
             if self._check_quit():
                 raise ExperimentAborted("user aborted during ISI")
             win.clearBuffer()
-            self._safe_flip()
+            win.flip()
 
     # ── teardown ──────────────────────────────────────────────────────────────
 
@@ -1134,53 +1110,25 @@ class SSVEPExperiment:
             wrapWidth=self._win.size[0] * 0.8
         )
         self._win.clearBuffer()
+        msg.draw()
+        self._win.flip()
+
+    def _update_status(self, lines: list) -> None:
+        """Update the top-left monospace status display with given lines."""
         try:
-            msg.draw()
-        except Exception as e:
-            print(f"[SHOW_MESSAGE DRAW ERROR] {e}", flush=True)
-        try:
-            self._safe_flip()
-        except Exception as e:
-            print(f"[SHOW_MESSAGE FLIP ERROR] {e}", flush=True)
-
-    def _update_status(self, lines: list):
-        text = "\n".join(lines)
-
-        # ALWAYS log to console
-        print("[STATUS]", text.replace("\n", " | "), flush=True)
-        try:
-            self._status_stim.text = text
-            self._win.clearBuffer()
-
-            if self._status_box:
-                try:
-                    self._status_box.draw()
-                except Exception:
-                    pass
-
-            try:
-                self._status_stim.draw()
-            except Exception as e:
-                print(f"[STATUS DRAW ERROR] {e}", flush=True)
-
-            try:
-                self._safe_flip()
-            except Exception as e:
-                print(f"[FLIP ERROR] {e}", flush=True)
-
-        except Exception as e:
-            print(f"[STATUS RENDER ERROR] {e}", flush=True)
+            if not hasattr(self, "_status_stim") or self._status_stim is None:
+                return
+            self._status_stim.text = "\n".join(lines)
+        except Exception:
+            # Do not raise from a status update; it's purely cosmetic.
+            pass
 
     def _abort_requested(self) -> bool:
         """Return True if the user pressed Escape/Q or closed the window."""
         try:
-            event.clearEvents()
             keys = event.getKeys(keyList=["escape", "q"])
             if keys:
                 return True
-            if self._win.winHandle and hasattr(self._win.winHandle, "has_exit"):
-                if self._win.winHandle.has_exit:
-                    return True
         except Exception:
             pass
 
@@ -1192,14 +1140,6 @@ class SSVEPExperiment:
         except Exception:
             pass
         return False
-
-    def _safe_flip(self) -> None:
-        """Flip the PsychoPy window, catching and logging errors."""
-        try:
-            if self._win:
-                self._win.flip()
-        except Exception as e:
-            print(f"[FLIP ERROR] {e}", flush=True)
 
     def _check_quit(self) -> bool:
         """Return True if the user requested to abort the experiment."""
@@ -1288,7 +1228,7 @@ if __name__ == "__main__":
         layout_cols      = 4,
 
         # ── Timing ─────────────────────────────────────────────────────────
-        n_trials         = 20,
+        n_trials         = 3,
         trial_duration_s = 4.0,
         isi_duration_s   = 1.0,
 

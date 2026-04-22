@@ -1,0 +1,12 @@
+event_type,psychopy_time_s,trial_number,stimulus_index,target_freq_hz,actual_freq_hz,idun_recording_id,notes
+EXPERIMENT_START,7.400289177894592e-06,-1,-1,-1.0,-1.0,,
+TRIAL_START,2.024419800378382,1,-1,-1.0,-1.0,,all_8_stimuli
+TRIAL_END,6.026732500176877,1,-1,-1.0,-1.0,,duration_s=4.0023
+ISI_START,6.026808900292963,1,-1,-1.0,-1.0,,
+TRIAL_START,7.027006100397557,2,-1,-1.0,-1.0,,all_8_stimuli
+TRIAL_END,11.028504600282758,2,-1,-1.0,-1.0,,duration_s=4.0015
+ISI_START,11.028584400191903,2,-1,-1.0,-1.0,,
+TRIAL_START,12.02875730022788,3,-1,-1.0,-1.0,,all_8_stimuli
+TRIAL_END,16.030298500321805,3,-1,-1.0,-1.0,,duration_s=4.0015
+ISI_START,16.030379300005734,3,-1,-1.0,-1.0,,
+EXPERIMENT_END,17.03051900025457,-1,-1,-1.0,-1.0,,total_trials=3
