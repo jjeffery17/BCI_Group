@@ -1322,7 +1322,7 @@ if __name__ == "__main__":
         # ── Display ────────────────────────────────────────────────────────
         monitor_name     = "testMonitor",   # PsychoPy monitor profile
         screen_index     = 0,
-        fullscreen       = True,
+        fullscreen       = False,
         target_fps       = 60,              # ← set to your monitor's refresh rate
 
         # ── Stimuli ────────────────────────────────────────────────────────
@@ -1346,8 +1346,8 @@ if __name__ == "__main__":
         # ── IDUN Guardian ──────────────────────────────────────────────────
         # Leave idun_api_token blank to use the IDUN_API_TOKEN env variable.
         # Leave idun_device_address blank to auto-search for the earbud.
-        enable_idun              = False,
-        idun_api_token           = "",
+        enable_idun              = True,
+        idun_api_token           = "idun_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJkNjM2YmRlZC1hMzc1LTRhZDUtYjM0NC1jYjBkNzllZmVjYmEiLCJ1aWQiOiIxZjYzZTFjNy03YjAwLTQ3ODUtODUwYS1jMDc0OTI3YzE4OGUiLCJkaWQiOiIwMC0wMi01Qi0wMC1GRi0wRiIsImlhdCI6MTc3NTc0MDgwMy45MDU4OTR9._p2y7JgEOG8AMKBTimomYm9HrLJzjlVup2rHMWIhylc",
         idun_device_address      = "",
         idun_recording_duration_s = 3600,
         idun_stream_live_eeg     = True,
