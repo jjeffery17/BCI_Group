@@ -182,7 +182,7 @@ class ExperimentConfig:
                 self.flicker_mode = FlickerMode.APPROXIMATION
         if self.flicker_type is None:
             if BLINKING_STIMULI_AVAILABLE:
-                self.flicker_type = FlickerType.ON_NEGATIVE
+                self.flicker_type = FlickerType.ON_OFF
         if self.color_mode is None:
             if BLINKING_STIMULI_AVAILABLE:
                 self.color_mode = ColorMode.GREYSCALE
@@ -1322,17 +1322,19 @@ if __name__ == "__main__":
         # ── Display ────────────────────────────────────────────────────────
         monitor_name     = "testMonitor",   # PsychoPy monitor profile
         screen_index     = 0,
-        fullscreen       = False,
+        fullscreen       = True,
         target_fps       = 60,              # ← set to your monitor's refresh rate
 
         # ── Stimuli ────────────────────────────────────────────────────────
         # Replace "placeholder.png" with your actual image path.
         # A colour-block placeholder will be generated automatically if the
         # file does not exist, so the experiment will still run for testing.
-        image_paths      = ["Images/WhiteSquare1.png", "Images/BlackSquare1.png"],
+        image_paths      = ["Images/WhiteSquare1.png", "Images/BlackSquare1.png", "Images/WhiteSquare1.png", "Images/BlackSquare1.png",
+                            "Images/BlackSquare1.png", "Images/WhiteSquare1.png", "Images/BlackSquare1.png", "Images/WhiteSquare1.png"],
         stimulus_size    = (150, 150),
-        flicker_frequencies = [8.0, 10.0],
-        layout           = "checkerboard",          # "grid", "checkerboard" or "circle"
+        flicker_frequencies = [6.0, 0.0, 8.0, 0.0,
+                               0.0, 11.0, 0.0, 15.0],
+        layout           = "grid",          # "grid", "checkerboard" or "circle"
         layout_rows      = 2,
         layout_cols      = 4,
 
