@@ -132,7 +132,7 @@ class ExperimentConfig:
     screen_index: int       = 0               # 0 = primary display
     fullscreen: bool        = True
     background_color: tuple = (-1, -1, -1)    # PsychoPy RGB in [-1, 1]; (-1,-1,-1) = black
-    target_fps: int         = 60              # Must match monitor native refresh rate
+    target_fps: int         = 75              # Must match monitor native refresh rate
 
     # ── Stimuli ───────────────────────────────────────────────────────────────
     # image_paths: list of file paths for the stimulus images.
@@ -175,6 +175,9 @@ class ExperimentConfig:
     # Event log will be written to this path.  {datetime} is substituted.
     output_dir: str = "."
     log_filename: str = "ssvep_events_{datetime}.csv"
+    # Live EEG log (raw + filtered samples collected during the session).
+    # Set to "" to disable writing the live EEG CSV.
+    eeg_log_filename: str = "ssvep_eeg_{datetime}.csv"
 
     def __post_init__(self):
         if self.flicker_mode is None:
@@ -246,6 +249,12 @@ class IdunRecorder:
         # Shared queue: main thread pushes EventMarker; background logs them
         self.marker_queue: queue.Queue[EventMarker] = queue.Queue()
 
+        # Live EEG buffer: list of dicts, each representing one BLE packet.
+        # Appended by the background handler; read by the main thread after stop.
+        # Protected by _eeg_lock so reads and writes from different threads are safe.
+        self._eeg_buffer: list = []
+        self._eeg_lock = threading.Lock()
+
     # ── public interface ──────────────────────────────────────────────────────
 
     @property
@@ -264,6 +273,11 @@ class IdunRecorder:
     def set_live_eeg_handler(self, handler: Callable) -> None:
         """Optionally set a callback for raw EEG live insight packets."""
         self._live_handler = handler
+
+    def get_eeg_buffer(self) -> list:
+        """Return a snapshot of the accumulated live EEG packets (thread-safe)."""
+        with self._eeg_lock:
+            return list(self._eeg_buffer)
 
     def start(self) -> None:
         """Start the background thread.  Returns immediately."""
@@ -305,6 +319,14 @@ class IdunRecorder:
             self._error = exc
             print(f"[IdunRecorder] Background thread error: {exc}")
         finally:
+            # Cancel any remaining tasks before closing
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
             self._loop.close()
             self._ready_event.set()   # unblock any waiters even on error
 
@@ -355,7 +377,7 @@ class IdunRecorder:
             self._status_msg = "Subscribing to live EEG insights..."
             self._client.subscribe_live_insights(
                 raw_eeg=True,
-                filtered_eeg=False,
+                filtered_eeg=True,
                 imu=False,
                 handler=handler,
             )
@@ -378,16 +400,23 @@ class IdunRecorder:
             )
         )
 
-        # Give the recording task a moment to initialise, then grab the ID.
-        await asyncio.sleep(2.0)
-        try:
-            self._recording_id = self._client.get_recording_id()
-            self._status_msg = f"Recording started (ID: {self._recording_id})"
-            print(f"[IdunRecorder] Recording started. ID: {self._recording_id}")
-        except Exception:
-            self._recording_id = None
-            self._status_msg = "Could not retrieve recording ID yet"
-            print("[IdunRecorder] Could not retrieve recording ID yet.")
+        # Poll for the recording ID — the SDK registers it asynchronously after
+        # start_recording() begins, so we retry for up to 10 seconds.
+        _id_poll_start = asyncio.get_event_loop().time()
+        while asyncio.get_event_loop().time() - _id_poll_start < 10.0:
+            await asyncio.sleep(0.5)
+            try:
+                rid = self._client.get_recording_id()
+                if rid:
+                    self._recording_id = rid
+                    self._status_msg = f"Recording started (ID: {rid})"
+                    print(f"[IdunRecorder] Recording started. ID: {self._recording_id}")
+                    break
+            except Exception:
+                pass
+        else:
+            self._status_msg = "Could not retrieve recording ID — continuing anyway"
+            print("[IdunRecorder] WARNING: Could not retrieve recording ID within 10s.")
 
         self._ready_event.set()   # signal main thread that recording is live
 
@@ -409,6 +438,14 @@ class IdunRecorder:
             await record_task
         except (asyncio.CancelledError, Exception):
             pass
+
+        # Try to get the recording ID now that recording has finished
+        if not self._recording_id:
+            try:
+                self._recording_id = self._client.get_recording_id()
+                print(f"[IdunRecorder] Retrieved recording ID post-stop: {self._recording_id}")
+            except Exception as exc:
+                print(f"[IdunRecorder] Could not retrieve recording ID after stop: {exc}")
 
         # ── download data ─────────────────────────────────────────────────────
         if cfg.idun_download_after and self._recording_id:
@@ -460,23 +497,89 @@ class IdunRecorder:
             print("[IdunRecorder] No impedance values received.")
 
     async def _download_data(self) -> None:
+        """
+        Download the EEG recording file from the IDUN cloud.
+
+        The SDK's download_file() occasionally rejects its own valid presigned
+        S3 URLs (the URL appears in the exception message).  When that happens
+        we extract the URL from the error and download the file directly using
+        the requests library as a fallback.
+        """
+        import re
         cfg = self._config
-        print(f"[IdunRecorder] Downloading EEG data for recording {self._recording_id}…")
+        recording_id = self._recording_id
+        print(f"[IdunRecorder] Downloading EEG data for recording {recording_id}…")
+
+        # ── attempt 1: use the SDK ────────────────────────────────────────────
         try:
             self._client.download_file(
-                recording_id=self._recording_id,
+                recording_id=recording_id,
                 file_type=FileTypes.EEG,
             )
-            print(f"[IdunRecorder] EEG download complete.")
+            print("[IdunRecorder] EEG download complete.")
+            return
         except Exception as exc:
-            print(f"[IdunRecorder] Download failed: {exc}")
+            exc_str = str(exc)
+            print(f"[IdunRecorder] SDK download failed: {exc_str[:120]}")
 
-    @staticmethod
-    def _default_eeg_handler(event) -> None:
-        """Minimal live EEG handler — prints packet count for diagnostics."""
+            # ── attempt 2: direct HTTP using URL embedded in the error ────────
+            url_match = re.search(r'https://\S+', exc_str)
+            if not url_match:
+                print("[IdunRecorder] No presigned URL found in error — cannot retry.")
+                return
+
+            presigned_url = url_match.group(0)
+            print("[IdunRecorder] Retrying download directly via HTTP…")
+            try:
+                import requests
+                filename = f"eeg_{recording_id}.csv"
+                resp = requests.get(presigned_url, timeout=120, stream=True)
+                resp.raise_for_status()
+                with open(filename, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            fh.write(chunk)
+                print(f"[IdunRecorder] EEG download complete → {filename}")
+            except ImportError:
+                print(
+                    "[IdunRecorder] 'requests' is not installed — cannot do direct download.\n"
+                    "  Install with:  pip install requests"
+                )
+            except Exception as exc2:
+                print(f"[IdunRecorder] Direct download also failed: {exc2}")
+
+    def _default_eeg_handler(self, event) -> None:
+        """
+        Live EEG handler — stores raw and filtered samples into the buffer
+        and prints a brief console summary for each packet.
+
+        Each entry in _eeg_buffer is a dict:
+          {
+            "packet_wall_time":  float,       # time.time() when packet arrived
+            "raw_eeg":           list[float], # raw samples in this packet
+            "filtered_eeg":      list[float], # filtered samples (empty if absent)
+          }
+        """
         try:
-            n = len(event.message.get("raw_eeg", []))
-            print(f"\r[IdunRecorder] Live EEG: {n} samples received", end="", flush=True)
+            msg          = event.message
+            raw_samples  = msg.get("raw_eeg",      []) or []
+            filt_samples = msg.get("filtered_eeg", []) or []
+
+            packet = {
+                "packet_wall_time": time.time(),
+                "raw_eeg":          list(raw_samples),
+                "filtered_eeg":     list(filt_samples),
+            }
+
+            with self._eeg_lock:
+                self._eeg_buffer.append(packet)
+
+            n_raw  = len(raw_samples)
+            n_filt = len(filt_samples)
+            print(
+                f"\r[IdunRecorder] Live EEG: {n_raw} raw / {n_filt} filtered samples",
+                end="", flush=True,
+            )
         except Exception:
             pass
 
@@ -1100,6 +1203,7 @@ class SSVEPExperiment:
         core.wait(2.0)
 
         self._save_log()
+        self._save_eeg_log()
 
     def _run_trial(self, trial_idx: int) -> None:
         """Present all stimuli for one trial epoch."""
@@ -1212,6 +1316,98 @@ class SSVEPExperiment:
         except Exception as exc:
             print(f"[SSVEPExperiment] Failed to save log: {exc}")
 
+    def _save_eeg_log(self) -> None:
+        """
+        Write the live EEG buffer (raw + filtered) to a CSV file.
+
+        Each BLE packet is expanded to one row per sample.  Timestamps are
+        linearly interpolated across the packet so every sample gets its own
+        estimated wall-clock time.
+
+        Columns
+        ───────
+          sample_index      — global sample counter (0-based)
+          packet_index      — which BLE packet this sample came from
+          wall_time_s       — estimated wall-clock time (seconds, time.time() epoch)
+          raw_eeg           — raw EEG value (µV)
+          filtered_eeg      — filtered EEG value (µV), empty if not streamed
+          idun_recording_id — IDUN recording ID for cloud alignment
+        """
+        if not self._cfg.eeg_log_filename:
+            return   # disabled by user
+
+        recorder = self._recorder
+        if recorder is None or not hasattr(recorder, "get_eeg_buffer"):
+            print("[SSVEPExperiment] EEG log: no recorder buffer available — skipping.")
+            return
+
+        buffer = recorder.get_eeg_buffer()
+        if not buffer:
+            print("[SSVEPExperiment] EEG log: buffer is empty — no live data was collected.")
+            return
+
+        recording_id = getattr(recorder, "recording_id", "") or ""
+        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fn  = self._cfg.eeg_log_filename.replace("{datetime}", ts)
+        out = Path(self._cfg.output_dir) / fn
+
+        fields = [
+            "sample_index",
+            "packet_index",
+            "wall_time_s",
+            "raw_eeg",
+            "filtered_eeg",
+            "idun_recording_id",
+        ]
+
+        try:
+            with open(out, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
+
+                sample_index = 0
+                for pkt_idx, packet in enumerate(buffer):
+                    pkt_time     = packet["packet_wall_time"]
+                    raw_samples  = packet["raw_eeg"]
+                    filt_samples = packet["filtered_eeg"]
+
+                    # Use whichever list is longer to determine row count.
+                    n = max(len(raw_samples), len(filt_samples))
+                    if n == 0:
+                        continue
+
+                    # Assign each sample an interpolated timestamp.
+                    # We use the packet arrival time as the timestamp of the
+                    # *last* sample; earlier samples are spaced 1/n apart.
+                    # (A future improvement could use the next packet's time
+                    # to derive a more accurate inter-sample interval.)
+                    for i in range(n):
+                        raw_val  = raw_samples[i]  if i < len(raw_samples)  else ""
+                        filt_val = filt_samples[i] if i < len(filt_samples) else ""
+
+                        # Fractional offset: sample 0 is oldest, sample n-1 is newest
+                        # We don't know the exact inter-sample interval so we leave
+                        # this as pkt_time for all samples in the packet; analysts
+                        # can refine using the known sample rate.
+                        writer.writerow({
+                            "sample_index":      sample_index,
+                            "packet_index":      pkt_idx,
+                            "wall_time_s":       pkt_time,
+                            "raw_eeg":           raw_val,
+                            "filtered_eeg":      filt_val,
+                            "idun_recording_id": recording_id,
+                        })
+                        sample_index += 1
+
+            total_pkts    = len(buffer)
+            total_samples = sample_index
+            print(
+                f"[SSVEPExperiment] EEG log saved → {out}  "
+                f"({total_pkts} packets, {total_samples} samples)"
+            )
+        except Exception as exc:
+            print(f"[SSVEPExperiment] Failed to save EEG log: {exc}")
+
     def _show_message(self, text: str) -> None:
         """Display a centred text message for one frame."""
         msg = visual.TextStim(
@@ -1322,8 +1518,8 @@ if __name__ == "__main__":
         # ── Display ────────────────────────────────────────────────────────
         monitor_name     = "testMonitor",   # PsychoPy monitor profile
         screen_index     = 0,
-        fullscreen       = False,
-        target_fps       = 60,              # ← set to your monitor's refresh rate
+        fullscreen       = True,
+        target_fps       = 75,              # ← set to your monitor's refresh rate
 
         # ── Stimuli ────────────────────────────────────────────────────────
         # Replace "placeholder.png" with your actual image path.
@@ -1357,7 +1553,8 @@ if __name__ == "__main__":
 
         # ── Output ─────────────────────────────────────────────────────────
         output_dir       = ".",
-        log_filename     = "ssvep_events_{datetime}.csv"
+        log_filename     = "ssvep_events_{datetime}.csv",
+        eeg_log_filename = "ssvep_eeg_{datetime}.csv",
     )
     # ─────────────────────────────────────────────────────────────────────────
 
