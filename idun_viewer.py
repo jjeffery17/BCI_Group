@@ -24,6 +24,15 @@ from matplotlib.gridspec import GridSpec
 
 from idun_guardian_sdk import GuardianClient
 
+import csv
+import time
+
+import threading
+csv_lock = threading.Lock()
+
+csv_file = None
+csv_writer = None
+
 # ─────────────────────────────────────────────
 #  CONFIG  –  fill in or set env var
 # ─────────────────────────────────────────────
@@ -63,15 +72,49 @@ _gui_closed        = threading.Event()   # set when graph window is closed → s
 #  Callbacks  (invoked from asyncio thread)
 # ─────────────────────────────────────────────
 def on_live_insights(event):
+    global csv_writer
+
     msg = event.message
+    raw_samples  = msg.get("raw_eeg", [])
+    filt_samples = msg.get("filtered_eeg", [])
 
-    for s in msg.get("raw_eeg", []):
-        raw_eeg_buf_ch1.append(s.get("ch1", 0))
-        raw_eeg_buf_ch2.append(s.get("ch2", 0))
+    n = min(len(raw_samples), len(filt_samples))
 
-    for s in msg.get("filtered_eeg", []):
-        filt_eeg_buf_ch1.append(s.get("ch1", 0))
-        filt_eeg_buf_ch2.append(s.get("ch2", 0))
+    base_time = time.time()
+    dt = 1.0 / EEG_SAMPLE_RATE
+
+    for i in range(n):
+        r = raw_samples[i]
+        f = filt_samples[i]
+
+        ch1_raw = r.get("ch1", 0)
+        ch2_raw = r.get("ch2", 0)
+
+        ch1_filt = f.get("ch1", 0)
+        ch2_filt = f.get("ch2", 0)
+
+        # Update buffers (for plotting)
+        raw_eeg_buf_ch1.append(ch1_raw)
+        raw_eeg_buf_ch2.append(ch2_raw)
+        filt_eeg_buf_ch1.append(ch1_filt)
+        filt_eeg_buf_ch2.append(ch2_filt)
+
+        # Accurate timestamp per sample
+        ts = base_time + i * dt
+        
+        if i % EEG_SAMPLE_RATE == 0 and csv_file:
+            csv_file.flush()
+
+        # STREAM WRITE
+        if csv_writer:
+            with csv_lock:
+                csv_writer.writerow([
+                    ts,
+                    ch1_raw,
+                    ch2_raw,
+                    ch1_filt,
+                    ch2_filt
+                ])
 
 
 def on_predictions(event):
@@ -115,8 +158,9 @@ async def run_checks(client: GuardianClient):
     except Exception as e:
         print(f"  MAC Addr  : (unavailable – {e})")
 
-    # Impedance – 5-second snapshot
-    print("\n  Measuring impedance for 5 s …")
+    # Impedance – {imp_time}-second snapshot
+    imp_time = 15
+    print(f"\n  Measuring impedance for {imp_time}s …")
     imp_readings: list = []
 
     def capture_impedance(data):
@@ -130,7 +174,7 @@ async def run_checks(client: GuardianClient):
         )
 
     task = asyncio.create_task(impedance_task())
-    await asyncio.sleep(5)
+    await asyncio.sleep(imp_time)
     client.stop_impedance()
     try:
         await task
@@ -177,6 +221,24 @@ async def async_main():
         handler=on_predictions,
     )
 
+    global csv_file, csv_writer
+
+    filename = f"eeg_recording_{int(time.time())}.csv"
+    print(f"💾 Streaming data to {filename}")
+
+    csv_file = open(filename, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+
+    # Write header
+    with csv_lock:
+        csv_writer.writerow([
+            "timestamp",
+            "raw_ch1",
+            "raw_ch2",
+            "filt_ch1",
+            "filt_ch2"
+        ])
+
     live_stats["status"] = "● Recording"
     _recording_started.set()   # ← unblocks the main thread to open the graph
 
@@ -199,7 +261,31 @@ async def async_main():
     live_stats["status"] = "● Disconnecting…"
     await client.disconnect_device()
     print("  Disconnected. Goodbye!\n")
+    if csv_file:
+        print("💾 Closing CSV file...")
+        csv_file.flush()
+        csv_file.close()
+    else:
+        print("💾 CSV file variable not found!")
 
+def save_to_csv(filename="eeg_recording.csv"):
+    print(f"\n💾 Saving data to {filename} ...")
+
+    with open(filename, "w", newline="") as f:
+        writer = csv.writer(f)
+
+        # Header
+        writer.writerow([
+            "timestamp",
+            "raw_ch1",
+            "raw_ch2",
+            "filt_ch1",
+            "filt_ch2"
+        ])
+
+        writer.writerows(data_log)
+
+    print(f"✅ Saved {len(data_log)} samples")
 
 def run_asyncio_in_thread():
     asyncio.run(async_main())
