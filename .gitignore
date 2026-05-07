@@ -1,3 +1,5 @@
 *.csv
 *.jsonl
 .env
+idun_lsl_decode_viewer.py
+idun_lsl_streamer.py
