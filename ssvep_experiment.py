@@ -1,44 +1,38 @@
 """
 ssvep_experiment.py
 ===================
-Experiment controller that bridges blinking_stimuli.py, PsychoPy, and the
-IDUN Guardian EEG earbud SDK.
+SSVEP stimulus experiment controller using blinking_stimuli.py and PsychoPy.
 
-Architecture overview
-─────────────────────
-  Main thread   — PsychoPy Window + blinking_stimuli Stimulus objects.
-                  Owns the display flip cycle and all trial timing.
-                  Uses PsychoPy's core.Clock as the single timing authority.
+Experiment structure
+────────────────────
+  4 rounds, one per target stimulus location:
+    - Top-left      (6 Hz)
+    - Top-right     (8 Hz)
+    - Bottom-left   (11 Hz)
+    - Bottom-right  (15 Hz)
 
-  Background thread — IDUN GuardianClient running its own asyncio event loop.
-                  Starts/stops the EEG recording and (optionally) subscribes
-                  to real-time insights without blocking the stimulus loop.
+  Each round:
+    - Instruction screen: which light to focus on (press SPACE to start)
+    - 5 continuous 5-second SSVEP epochs
+    - A short, defined break between repeats
 
-  Thread-safe queue — carries EventMarker objects from the main thread to the
-                  background thread so that stimulus onsets are time-stamped
-                  against the IDUN cloud recording ID for later alignment.
+  Total: 4 rounds × 5 repeats × 5 s of stimulus time, plus short breaks.
 
 Typical usage
 ─────────────
   1. Edit the EXPERIMENT CONFIG block near the bottom of this file.
   2. Run:  python ssvep_experiment.py
-  3. The console prints impedance / battery info, then the trial loop starts.
-  4. After the experiment the IDUN recording is stopped, data downloaded, and
-     a CSV event log is written alongside this file.
+  3. A fullscreen PsychoPy window opens; follow the on-screen instructions.
+  4. After the experiment a CSV event log is written alongside this file.
 
 Dependencies
 ────────────
-  Required:
-    pip install psychopy pygame
-
-  For IDUN data collection (optional — experiment runs without it):
-    pip install idun-guardian-sdk
-    Set IDUN_API_TOKEN environment variable or fill in IDUN_API_TOKEN below.
+  pip install psychopy pygame numpy
 
   blinking_stimuli.py must be in the same directory as this file.
 
 Notes on pygame / PsychoPy co-existence
-─────────────────────────────────────────
+────────────────────────────────────────
   PsychoPy opens its own OpenGL/pyglet window.  pygame is imported by
   blinking_stimuli.py but its display subsystem is never initialised here —
   only the Stimulus scheduling maths and image-processing helpers are used.
@@ -48,17 +42,12 @@ Notes on pygame / PsychoPy co-existence
 
 from __future__ import annotations
 
-import asyncio
 import csv
-import os
-import queue
 import sys
-import threading
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -80,14 +69,10 @@ except ImportError:
 
 # blinking_stimuli ────────────────────────────────────────────────────────────
 try:
-    # Allow blinking_stimuli.py to live alongside this file without being on
-    # sys.path by default.
     _here = Path(__file__).resolve().parent
     if str(_here) not in sys.path:
         sys.path.insert(0, str(_here))
 
-    # We import only the scheduling / image classes — NOT the StimulusDisplay
-    # application class, which owns its own pygame display loop.
     import pygame  # imported transitively; we will NOT call pygame.display.init
     from blinking_stimuli import (
         Stimulus,
@@ -106,18 +91,6 @@ except ImportError as _err:
         f"  and that pygame is installed:  pip install pygame"
     )
 
-# IDUN Guardian SDK ────────────────────────────────────────────────────────────
-try:
-    from idun_guardian_sdk import GuardianClient, FileTypes
-    IDUN_AVAILABLE = True
-except ImportError:
-    IDUN_AVAILABLE = False
-    print(
-        "[ssvep_experiment] INFO: idun-guardian-sdk is not installed.\n"
-        "  The experiment will run without EEG recording.\n"
-        "  Install with:  pip install idun-guardian-sdk"
-    )
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data structures
@@ -131,12 +104,10 @@ class ExperimentConfig:
     monitor_name: str       = "testMonitor"   # PsychoPy monitor profile name
     screen_index: int       = 0               # 0 = primary display
     fullscreen: bool        = True
-    background_color: tuple = (-1, -1, -1)    # PsychoPy RGB in [-1, 1]; (-1,-1,-1) = black
+    background_color: tuple = (-1, -1, -1)    # PsychoPy RGB in [-1, 1]; black
     target_fps: int         = 75              # Must match monitor native refresh rate
 
     # ── Stimuli ───────────────────────────────────────────────────────────────
-    # image_paths: list of file paths for the stimulus images.
-    # Use a single shared image or one per stimulus.  Cycled via QuickLayout.
     image_paths: list       = field(default_factory=lambda: ["placeholder.png"])
     stimulus_size: tuple    = (150, 150)      # pixels (width, height)
     flicker_frequencies: list = field(
@@ -154,30 +125,26 @@ class ExperimentConfig:
     layout_circle_radius: float = 0.38
 
     # ── Timing ────────────────────────────────────────────────────────────────
-    n_trials: int           = 20
-    trial_duration_s: float = 4.0     # seconds each stimulus epoch runs for
-    isi_duration_s: float   = 1.0     # inter-stimulus interval (blank screen)
-    pre_experiment_rest_s: float = 2.0  # rest period before first trial
+    # Structure: 4 rounds × n_repeats_per_round × trial_duration_s
+    n_rounds: int           = 4     # one round per target location
+    n_repeats_per_round: int = 5    # SSVEP epochs within each round
+    trial_duration_s: float = 5.0   # seconds per SSVEP epoch
+    repeat_break_s: float   = 0.75  # short pause between repeats
+    pre_experiment_rest_s: float = 2.0
 
-    # ── IDUN Guardian ────────────────────────────────────────────────────────
-    enable_idun: bool           = True
-    idun_api_token: str         = ""          # or set IDUN_API_TOKEN env var
-    idun_device_address: str    = ""          # leave blank to auto-search
-    idun_recording_duration_s: int = 3600     # 1 hour max; auto-stopped at end
-    idun_stream_live_eeg: bool  = True        # subscribe to raw EEG live stream
-    idun_mains_60hz: bool       = False       # True for North America (60 Hz)
-    idun_led_sleep: bool        = False       # False = keep LED on during recording
-    idun_impedance_check: bool  = True        # run impedance check before experiment
-    idun_impedance_duration_s: int = 10       # seconds to stream impedance
-    idun_download_after: bool   = True        # download EEG file when done
+    # ── Round labels ─────────────────────────────────────────────────────────
+    # Order must match the active stimulus positions in your layout.
+    # Default: top-left, top-right, bottom-left, bottom-right.
+    round_labels: list      = field(default_factory=lambda: [
+        "top left",
+        "top right",
+        "bottom left",
+        "bottom right",
+    ])
 
     # ── Output ────────────────────────────────────────────────────────────────
-    # Event log will be written to this path.  {datetime} is substituted.
     output_dir: str = "."
     log_filename: str = "ssvep_events_{datetime}.csv"
-    # Live EEG log (raw + filtered samples collected during the session).
-    # Set to "" to disable writing the live EEG CSV.
-    eeg_log_filename: str = "ssvep_eeg_{datetime}.csv"
 
     def __post_init__(self):
         if self.flicker_mode is None:
@@ -193,395 +160,17 @@ class ExperimentConfig:
 
 @dataclass
 class EventMarker:
-    """A single time-stamped event written to the CSV log.
-
-    All times are in seconds relative to the experiment start clock
-    (psychopy.core.Clock started at experiment onset).
-    """
-    event_type: str          # "TRIAL_START" | "TRIAL_END" | "ISI_START" | "EXPERIMENT_START" | "EXPERIMENT_END"
-    psychopy_time_s: float   # PsychoPy clock time at this event
-    trial_number: int        = -1
-    stimulus_index: int      = -1    # index into stimuli list; -1 = N/A
-    target_freq_hz: float    = -1.0
-    actual_freq_hz: float    = -1.0
-    idun_recording_id: str   = ""    # populated once IDUN recording starts
+    """A single time-stamped event written to the CSV log."""
+    event_type: str          # e.g. "EXPERIMENT_START", "ROUND_START", "EPOCH_START"
+    psychopy_time_s: float
+    round_number: int        = -1   # 1-based
+    repeat_number: int       = -1   # 1-based within round
+    round_label: str         = ""   # e.g. "top left"
     notes: str               = ""
 
 
 class ExperimentAborted(RuntimeError):
     """Raised when the user aborts the experiment via keyboard or window close."""
-
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# IDUN Guardian background recorder
-# ──────────────────────────────────────────────────────────────────────────────
-
-class IdunRecorder:
-    """
-    Wraps GuardianClient in a background thread with its own asyncio loop.
-
-    The IDUN SDK requires all calls to share the same asyncio event loop (Bleak
-    BLE limitation).  Running this in a background thread lets the main thread
-    drive the PsychoPy stimulus display without interruption.
-
-    Usage
-    ─────
-        recorder = IdunRecorder(config)
-        recorder.start()                      # non-blocking; returns immediately
-        recording_id = recorder.recording_id  # available once recording begins
-        recorder.stop()                       # graceful shutdown
-    """
-
-    def __init__(self, config: ExperimentConfig):
-        self._config       = config
-        self._thread: Optional[threading.Thread] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._client: Optional[GuardianClient] = None
-        self._ready_event  = threading.Event()   # set when recording starts
-        self._stop_event   = threading.Event()   # set to request shutdown
-        self._recording_id: Optional[str] = None
-        self._error: Optional[Exception]  = None
-        self._live_handler: Optional[Callable] = None
-        # Human-readable status string updated by the background thread.
-        self._status_msg: str = "initialised"
-
-        # Shared queue: main thread pushes EventMarker; background logs them
-        self.marker_queue: queue.Queue[EventMarker] = queue.Queue()
-
-        # Live EEG buffer: list of dicts, each representing one BLE packet.
-        # Appended by the background handler; read by the main thread after stop.
-        # Protected by _eeg_lock so reads and writes from different threads are safe.
-        self._eeg_buffer: list = []
-        self._eeg_lock = threading.Lock()
-
-    # ── public interface ──────────────────────────────────────────────────────
-
-    @property
-    def recording_id(self) -> Optional[str]:
-        return self._recording_id
-
-    @property
-    def is_ready(self) -> bool:
-        """True once the IDUN recording has successfully started."""
-        return self._ready_event.is_set()
-
-    @property
-    def error(self) -> Optional[Exception]:
-        return self._error
-
-    def set_live_eeg_handler(self, handler: Callable) -> None:
-        """Optionally set a callback for raw EEG live insight packets."""
-        self._live_handler = handler
-
-    def get_eeg_buffer(self) -> list:
-        """Return a snapshot of the accumulated live EEG packets (thread-safe)."""
-        with self._eeg_lock:
-            return list(self._eeg_buffer)
-
-    def start(self) -> None:
-        """Start the background thread.  Returns immediately."""
-        if not IDUN_AVAILABLE:
-            print("[IdunRecorder] IDUN SDK not available — skipping EEG recording.")
-            self._ready_event.set()   # unblock any waiters
-            return
-        self._status_msg = "starting background thread"
-        self._thread = threading.Thread(
-            target=self._run_loop, name="IdunRecorderThread", daemon=True
-        )
-        self._thread.start()
-
-    def wait_until_ready(self, timeout_s: float = 60.0) -> bool:
-        """Block the calling thread until the recording has started or timeout."""
-        return self._ready_event.wait(timeout=timeout_s)
-
-    def push_marker(self, marker: EventMarker) -> None:
-        """Thread-safe: queue an event marker from the main thread."""
-        if self._recording_id:
-            marker.idun_recording_id = self._recording_id
-        self.marker_queue.put_nowait(marker)
-
-    def stop(self) -> None:
-        """Signal the background thread to stop and wait for it to finish."""
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=30)
-
-    # ── background thread ─────────────────────────────────────────────────────
-
-    def _run_loop(self) -> None:
-        """Entry point for the background thread."""
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._async_main())
-        except Exception as exc:
-            self._error = exc
-            print(f"[IdunRecorder] Background thread error: {exc}")
-        finally:
-            # Cancel any remaining tasks before closing
-            pending = asyncio.all_tasks(self._loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                self._loop.run_until_complete(
-                    asyncio.gather(*pending, return_exceptions=True)
-                )
-            self._loop.close()
-            self._ready_event.set()   # unblock any waiters even on error
-
-    async def _async_main(self) -> None:
-        cfg = self._config
-
-        api_token = cfg.idun_api_token or os.environ.get("IDUN_API_TOKEN", "")
-        address   = cfg.idun_device_address or None
-
-        self._client = GuardianClient(
-            api_token=api_token,
-            address=address,
-        )
-
-        # ── connect ───────────────────────────────────────────────────────────
-        self._status_msg = "Connecting to IDUN Guardian earbud…"
-        print("[IdunRecorder] Connecting to IDUN Guardian earbud…")
-        try:
-            await self._client.connect_device()
-            self._status_msg = "Connected"
-            print("[IdunRecorder] Connected.")
-        except Exception as exc:
-            self._status_msg = f"Connection failed: {exc}"
-            print(f"[IdunRecorder] Connection failed: {exc}")
-            raise
-
-        # ── battery check ────────────────────────────────────────────────────
-        try:
-            self._status_msg = "Checking battery level..."
-            battery = await self._client.check_battery()
-            self._status_msg = f"Battery: {battery}%"
-            print(f"[IdunRecorder] Battery level: {battery}%")
-            if battery < 20:
-                print("[IdunRecorder] WARNING: Battery below 20% — consider charging.")
-        except Exception as exc:
-            self._status_msg = f"Battery check failed: {exc}"
-            print(f"[IdunRecorder] Battery check failed: {exc}")
-
-        # ── impedance check ──────────────────────────────────────────────────
-        if cfg.idun_impedance_check:
-            self._status_msg = "Running impedance check..."
-            await self._run_impedance_check()
-            self._status_msg = "Impedance check complete"
-
-        # ── subscribe to live EEG ────────────────────────────────────────────
-        if cfg.idun_stream_live_eeg:
-            handler = self._live_handler or self._default_eeg_handler
-            self._status_msg = "Subscribing to live EEG insights..."
-            self._client.subscribe_live_insights(
-                raw_eeg=True,
-                filtered_eeg=True,
-                imu=False,
-                handler=handler,
-            )
-            self._status_msg = "Subscribed to live EEG"
-
-        # ── start recording ───────────────────────────────────────────────────
-        self._status_msg = f"Starting recording ({cfg.idun_recording_duration_s}s max)"
-        print(f"[IdunRecorder] Starting recording ({cfg.idun_recording_duration_s}s max)…")
-
-        # Retrieve the recording ID once the recording is initialised.
-        # start_recording() blocks until the recording ends, so we must
-        # obtain the ID before it returns.  The SDK stores it internally;
-        # we poll briefly after the call returns — but we also need to grab it
-        # before the await completes.  We do this by launching start_recording
-        # as a task and querying get_recording_id() once it starts.
-        record_task = asyncio.create_task(
-            self._client.start_recording(
-                recording_timer=cfg.idun_recording_duration_s,
-                led_sleep=cfg.idun_led_sleep,
-            )
-        )
-
-        # Poll for the recording ID — the SDK registers it asynchronously after
-        # start_recording() begins, so we retry for up to 10 seconds.
-        _id_poll_start = asyncio.get_event_loop().time()
-        while asyncio.get_event_loop().time() - _id_poll_start < 10.0:
-            await asyncio.sleep(0.5)
-            try:
-                rid = self._client.get_recording_id()
-                if rid:
-                    self._recording_id = rid
-                    self._status_msg = f"Recording started (ID: {rid})"
-                    print(f"[IdunRecorder] Recording started. ID: {self._recording_id}")
-                    break
-            except Exception:
-                pass
-        else:
-            self._status_msg = "Could not retrieve recording ID — continuing anyway"
-            print("[IdunRecorder] WARNING: Could not retrieve recording ID within 10s.")
-
-        self._ready_event.set()   # signal main thread that recording is live
-
-        # ── drain marker queue while recording runs ───────────────────────────
-        while not self._stop_event.is_set():
-            try:
-                _marker = self.marker_queue.get_nowait()
-                # Markers are consumed here; the main thread also writes them to
-                # CSV independently, so this loop exists for future extension
-                # (e.g. sending annotations to the IDUN cloud API).
-            except queue.Empty:
-                pass
-            await asyncio.sleep(0.05)
-
-        # ── stop recording ───────────────────────────────────────────────────
-        print("[IdunRecorder] Stopping recording…")
-        record_task.cancel()
-        try:
-            await record_task
-        except (asyncio.CancelledError, Exception):
-            pass
-
-        # Try to get the recording ID now that recording has finished
-        if not self._recording_id:
-            try:
-                self._recording_id = self._client.get_recording_id()
-                print(f"[IdunRecorder] Retrieved recording ID post-stop: {self._recording_id}")
-            except Exception as exc:
-                print(f"[IdunRecorder] Could not retrieve recording ID after stop: {exc}")
-
-        # ── download data ─────────────────────────────────────────────────────
-        if cfg.idun_download_after and self._recording_id:
-            await self._download_data()
-
-        # ── disconnect ────────────────────────────────────────────────────────
-        try:
-            await self._client.disconnect_device()
-            print("[IdunRecorder] Disconnected.")
-        except Exception as exc:
-            print(f"[IdunRecorder] Disconnect error: {exc}")
-
-    async def _run_impedance_check(self) -> None:
-        """Stream impedance for a fixed duration and print the result."""
-        cfg = self._config
-        print(
-            f"[IdunRecorder] Running impedance check "
-            f"({cfg.idun_impedance_duration_s}s)…"
-        )
-        impedance_values: list[float] = []
-
-        def _imp_handler(data):
-            try:
-                impedance_values.append(float(data))
-            except (TypeError, ValueError):
-                pass
-
-        imp_task = asyncio.create_task(
-            self._client.stream_impedance(
-                handler=_imp_handler,
-                mains_freq_60hz=cfg.idun_mains_60hz,
-            )
-        )
-        await asyncio.sleep(cfg.idun_impedance_duration_s)
-        self._client.stop_impedance()
-        try:
-            await imp_task
-        except Exception:
-            pass
-
-        if impedance_values:
-            avg_kohm = sum(impedance_values) / len(impedance_values) / 1000
-            print(f"[IdunRecorder] Average impedance: {avg_kohm:.1f} kΩ", end="  ")
-            if avg_kohm > 300:
-                print("⚠ HIGH — reposition earbud and clean ear canal")
-            else:
-                print("✓ acceptable (< 300 kΩ)")
-        else:
-            print("[IdunRecorder] No impedance values received.")
-
-    async def _download_data(self) -> None:
-        """
-        Download the EEG recording file from the IDUN cloud.
-
-        The SDK's download_file() occasionally rejects its own valid presigned
-        S3 URLs (the URL appears in the exception message).  When that happens
-        we extract the URL from the error and download the file directly using
-        the requests library as a fallback.
-        """
-        import re
-        cfg = self._config
-        recording_id = self._recording_id
-        print(f"[IdunRecorder] Downloading EEG data for recording {recording_id}…")
-
-        # ── attempt 1: use the SDK ────────────────────────────────────────────
-        try:
-            self._client.download_file(
-                recording_id=recording_id,
-                file_type=FileTypes.EEG,
-            )
-            print("[IdunRecorder] EEG download complete.")
-            return
-        except Exception as exc:
-            exc_str = str(exc)
-            print(f"[IdunRecorder] SDK download failed: {exc_str[:120]}")
-
-            # ── attempt 2: direct HTTP using URL embedded in the error ────────
-            url_match = re.search(r'https://\S+', exc_str)
-            if not url_match:
-                print("[IdunRecorder] No presigned URL found in error — cannot retry.")
-                return
-
-            presigned_url = url_match.group(0)
-            print("[IdunRecorder] Retrying download directly via HTTP…")
-            try:
-                import requests
-                filename = f"eeg_{recording_id}.csv"
-                resp = requests.get(presigned_url, timeout=120, stream=True)
-                resp.raise_for_status()
-                with open(filename, "wb") as fh:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        if chunk:
-                            fh.write(chunk)
-                print(f"[IdunRecorder] EEG download complete → {filename}")
-            except ImportError:
-                print(
-                    "[IdunRecorder] 'requests' is not installed — cannot do direct download.\n"
-                    "  Install with:  pip install requests"
-                )
-            except Exception as exc2:
-                print(f"[IdunRecorder] Direct download also failed: {exc2}")
-
-    def _default_eeg_handler(self, event) -> None:
-        """
-        Live EEG handler — stores raw and filtered samples into the buffer
-        and prints a brief console summary for each packet.
-
-        Each entry in _eeg_buffer is a dict:
-          {
-            "packet_wall_time":  float,       # time.time() when packet arrived
-            "raw_eeg":           list[float], # raw samples in this packet
-            "filtered_eeg":      list[float], # filtered samples (empty if absent)
-          }
-        """
-        try:
-            msg          = event.message
-            raw_samples  = msg.get("raw_eeg",      []) or []
-            filt_samples = msg.get("filtered_eeg", []) or []
-
-            packet = {
-                "packet_wall_time": time.time(),
-                "raw_eeg":          list(raw_samples),
-                "filtered_eeg":     list(filt_samples),
-            }
-
-            with self._eeg_lock:
-                self._eeg_buffer.append(packet)
-
-            n_raw  = len(raw_samples)
-            n_filt = len(filt_samples)
-            print(
-                f"\r[IdunRecorder] Live EEG: {n_raw} raw / {n_filt} filtered samples",
-                end="", flush=True,
-            )
-        except Exception:
-            pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -615,17 +204,15 @@ class PsychoPyStimDriver:
         self._win          = win
         self._stimuli      = stimuli
         self._refresh_rate = refresh_rate
-        self._psychopy_on:  list = []   # ImageStim for ON phase
-        self._psychopy_off: list = []   # ImageStim for OFF phase (or None)
+        self._psychopy_on:  list = []
+        self._psychopy_off: list = []
 
         W, H = win.size
         self._W, self._H = W, H
 
-        # Configure blinking_stimuli scheduling (normally done by StimulusDisplay)
         for s in stimuli:
             s._configure(refresh_rate)
 
-        # Build PsychoPy ImageStim objects from the pre-rendered pygame surfaces
         try:
             import numpy as np
             for s in stimuli:
@@ -653,8 +240,6 @@ class PsychoPyStimDriver:
                 "  pip install numpy"
             )
 
-    # ── per-frame interface ───────────────────────────────────────────────────
-
     def draw(self) -> None:
         """Draw all stimuli for the current frame (call before win.flip())."""
         for i, s in enumerate(self._stimuli):
@@ -669,25 +254,20 @@ class PsychoPyStimDriver:
             s.update()
 
     def reset_frames(self) -> None:
-        """Reset all frame counters to 0 (call at trial onset)."""
+        """Reset all frame counters to 0 (call at epoch onset)."""
         for s in self._stimuli:
             s._frame = 0
 
-    # ── helpers ───────────────────────────────────────────────────────────────
-
     def _to_psychopy_coords(self, pos: tuple) -> tuple:
-        """Convert pixel (x, y) from top-left origin to PsychoPy centre origin."""
         px, py = pos
         return (px - self._W / 2, -(py - self._H / 2))
 
     @staticmethod
     def _surface_to_array(surf: "pygame.Surface"):
         """
-        Convert a pygame Surface to a numpy uint8 array suitable for
-        psychopy.visual.ImageStim.
-
-        PsychoPy's ImageStim accepts an (H, W, 3) uint8 array.
-        pygame.surfarray.array3d returns (W, H, 3), so we transpose axes 0 and 1.
+        Convert a pygame Surface to a numpy float32 array for PsychoPy ImageStim.
+        pygame.surfarray.array3d → (W, H, 3); we transpose to (H, W, 3) then
+        normalise to [-1, 1].
         """
         import numpy as np
         import pygame
@@ -695,33 +275,28 @@ class PsychoPyStimDriver:
         import time
         from pathlib import Path
 
-        arr = pygame.surfarray.array3d(surf)   # (W, H, 3)
-        # Transpose to (H, W, 3)
-        arr = arr.transpose(1, 0, 2)
-
-        # Convert to float32 in range [-1, 1] as required by PsychoPy for
-        # numpy texture arrays (black=-1, white=+1).
+        arr   = pygame.surfarray.array3d(surf)   # (W, H, 3)
+        arr   = arr.transpose(1, 0, 2)           # (H, W, 3)
         arr_f = arr.astype(np.float32) / 127.5 - 1.0
 
-        # Diagnostics: print concise array statistics (float range)
         try:
-            mn = float(arr_f.min())
-            mx = float(arr_f.max())
+            mn   = float(arr_f.min())
+            mx   = float(arr_f.max())
             mean = float(arr_f.mean())
         except Exception:
             mn = mx = mean = None
         print(
-            f"[PsychoPyStimDriver] _surface_to_array: shape={arr_f.shape} dtype={arr_f.dtype} min={mn:.3f} max={mx:.3f} mean={mean:.3f}",
+            f"[PsychoPyStimDriver] _surface_to_array: shape={arr_f.shape} "
+            f"dtype={arr_f.dtype} min={mn:.3f} max={mx:.3f} mean={mean:.3f}",
             flush=True,
         )
 
-        # Save a uint8 preview for offline inspection (Pillow optional).
         try:
             from PIL import Image
             tmpdir = Path(tempfile.gettempdir()) / "ssvep_debug"
             tmpdir.mkdir(exist_ok=True)
             preview = ((arr_f + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-            fname = tmpdir / f"stim_preview_{int(time.time()*1000)}.png"
+            fname   = tmpdir / f"stim_preview_{int(time.time()*1000)}.png"
             Image.fromarray(preview).save(str(fname))
             print(f"[PsychoPyStimDriver] saved preview → {fname}", flush=True)
         except Exception:
@@ -738,26 +313,28 @@ class SSVEPExperiment:
     """
     Orchestrates the full SSVEP experiment session.
 
-    Lifecycle
+    Structure
     ─────────
-      experiment = SSVEPExperiment(config)
-      experiment.setup()
-      experiment.run()
-      experiment.teardown()
+      For each of 4 rounds:
+        1. Instruction screen naming the target (e.g. "top left").
+           Participant presses SPACE to begin.
+        2. 5 consecutive 5-second SSVEP epochs with a short break between repeats.
 
-    Or, equivalently:
+      Total stimulus time: 4 × 5 × 5 s, plus the repeat breaks.
+
+    Usage
+    ─────
       SSVEPExperiment(config).run_full_session()
     """
 
     def __init__(self, config: ExperimentConfig):
-        self._cfg          = config
-        self._win          = None
-        self._clock        = None
-        self._stimuli      = []
-        self._driver       = None
-        self._recorder     = None
+        self._cfg       = config
+        self._win       = None
+        self._clock     = None
+        self._stimuli   = []
+        self._driver    = None
         self._event_log: list[EventMarker] = []
-        self._kb           = None
+        self._kb        = None
 
     # ── public entry point ────────────────────────────────────────────────────
 
@@ -776,7 +353,7 @@ class SSVEPExperiment:
     # ── setup ─────────────────────────────────────────────────────────────────
 
     def setup(self) -> None:
-        """Initialise display, stimuli, IDUN recorder."""
+        """Initialise display and stimuli."""
         print("[SSVEPExperiment] setup: starting", flush=True)
         self._check_dependencies()
         print("[SSVEPExperiment] setup: dependencies OK", flush=True)
@@ -794,7 +371,7 @@ class SSVEPExperiment:
                 units="pix",
                 winType="pyglet",
                 allowGUI=False,
-                checkTiming=False,   # we do our own timing
+                checkTiming=False,
             )
             print("[SSVEPExperiment] setup: PsychoPy window created", flush=True)
         except Exception as exc:
@@ -802,14 +379,15 @@ class SSVEPExperiment:
             print(f"[SSVEPExperiment] ERROR creating PsychoPy window: {exc}", flush=True)
             traceback.print_exc()
             raise
+
         W, H = self._win.size
 
-        # Initialise a more visible status panel (semi-transparent box + monospace text)
+        # ── status overlay ────────────────────────────────────────────────────
         try:
             panel_w = int(W * 0.6)
             panel_h = int(H * 0.22)
             panel_x = -W / 2 + panel_w / 2 + 20
-            panel_y = H / 2 - panel_h / 2 - 20
+            panel_y =  H / 2 - panel_h / 2 - 20
             self._status_box = visual.Rect(
                 self._win,
                 width=panel_w,
@@ -835,12 +413,12 @@ class SSVEPExperiment:
                 font="Courier New",
             )
         except Exception:
-            self._status_box = None
-            self._status_stim = visual.TextStim(self._win, text="", color=(1, 1, 1), height=22, units="pix")
+            self._status_box  = None
+            self._status_stim = visual.TextStim(
+                self._win, text="", color=(1, 1, 1), height=22, units="pix"
+            )
 
-
-        # Measure actual refresh rate using a non-blocking loop so the user can
-        # see progress and abort with Escape / window close.
+        # ── measure refresh rate ──────────────────────────────────────────────
         try:
             print("[SSVEPExperiment] Measuring frame rate interactively", flush=True)
             measured = self._measure_refresh_rate_interactive()
@@ -854,11 +432,15 @@ class SSVEPExperiment:
 
         refresh_rate = measured if (measured and measured > 10) else float(self._cfg.target_fps)
         measured_str = f"{measured:.2f}" if measured else "N/A"
-        print(f"[SSVEPExperiment] PsychoPy measured frame rate: {measured_str} Hz  (using {refresh_rate:.1f} Hz)", flush=True)
+        print(
+            f"[SSVEPExperiment] PsychoPy measured frame rate: {measured_str} Hz  "
+            f"(using {refresh_rate:.1f} Hz)",
+            flush=True,
+        )
         if abs(refresh_rate - self._cfg.target_fps) > 2.0:
             print(
                 f"[SSVEPExperiment] WARNING: Measured rate ({refresh_rate:.1f} Hz) "
-                f"differs from TARGET_FPS ({self._cfg.target_fps}). "
+                f"differs from target_fps ({self._cfg.target_fps}). "
                 f"Update target_fps in ExperimentConfig."
             )
 
@@ -868,124 +450,253 @@ class SSVEPExperiment:
         # ── keyboard ─────────────────────────────────────────────────────────
         self._kb = keyboard.Keyboard()
 
-        # ── build stimuli via blinking_stimuli QuickLayout ───────────────────
+        # ── build stimuli ─────────────────────────────────────────────────────
         print(f"[SSVEPExperiment] Building stimuli for W={W}, H={H}", flush=True)
         self._stimuli = self._build_stimuli(W, H)
-        # Diagnostics: print image path and target frequency for each stimulus
-        try:
-            print("[SSVEPExperiment] Diagnostics: stimulus image paths and target freqs:", flush=True)
-            for i, s in enumerate(self._stimuli):
-                img = getattr(s, "image_path", None)
-                tf  = getattr(s, "target_freq", None)
-                fm  = getattr(s, "flicker_mode", None)
-                ft  = getattr(s, "flicker_type", None)
-                cm  = getattr(s, "color_mode", None)
-                ph  = getattr(s, "phase", None)
-                print(
-                    f"  Stim {i}: image={img}  target_freq={tf}  "
-                    f"flicker_mode={fm}  flicker_type={ft}  color_mode={cm}  phase={ph}",
-                    flush=True,
-                )
-        except Exception:
-            pass
         print(
             f"[SSVEPExperiment] {len(self._stimuli)} stimuli created "
             f"({self._cfg.layout} layout)."
         )
 
-        # ── PsychoPy stimulus driver ─────────────────────────────────────────
+        # ── PsychoPy stimulus driver ──────────────────────────────────────────
         print("[SSVEPExperiment] Initialising PsychoPyStimDriver", flush=True)
         self._driver = PsychoPyStimDriver(self._win, self._stimuli, refresh_rate)
         print("[SSVEPExperiment] PsychoPyStimDriver initialised", flush=True)
 
-        # ── IDUN recorder (background thread) ────────────────────────────────
-        if self._cfg.enable_idun:
-            self._recorder = IdunRecorder(self._cfg)
-        else:
-            # lightweight dummy to satisfy callers
-            class _Dummy:
-                is_ready = True
-                error = None
-                recording_id = None
-                def start(self): pass
-                def push_marker(self, m): pass
-                def stop(self): pass
-            self._recorder = _Dummy()
-        print("[SSVEPExperiment] Starting IDUN recorder (if available)", flush=True)
-        self._recorder.start()
-        print("[SSVEPExperiment] IDUN recorder start() returned", flush=True)
+    # ── main experiment ───────────────────────────────────────────────────────
 
-        # Wait up to 90 s for the IDUN recording to start.  This covers the
-        # impedance check + BLE connection.  We poll in a loop so we can
-        # display progress on-screen (refresh-rate detection + connection).
-        timeout = 90.0
-        poll = 0.5
-        start_t = time.time()
-        print("[SSVEPExperiment] Waiting for IDUN recorder to be ready…")
-        while True:
-            elapsed = time.time() - start_t
-            status_msg = getattr(self._recorder, "_status_msg", "starting...")
-            lines = [
-                f"Refresh rate: {refresh_rate:.1f} Hz",
-                f"IDUN status: {status_msg}",
-                f"Waiting for IDUN recorder: {int(elapsed)}s / {int(timeout)}s",
-                "",
-                "Press Esc or close the window to abort",
-            ]
-            try:
-                self._update_status(lines)
-                self._win.clearBuffer()
-                if hasattr(self, "_status_box") and self._status_box is not None:
-                    self._status_box.draw()
-                if hasattr(self, "_status_stim") and self._status_stim is not None:
-                    self._status_stim.draw()
-                self._win.flip()
-            except Exception:
-                pass
-
-            if self._abort_requested():
-                print("[SSVEPExperiment] User requested abort during setup.", flush=True)
-                raise ExperimentAborted("user aborted during setup")
-
-            if self._recorder.is_ready:
-                break
-            if elapsed >= timeout:
-                break
-            time.sleep(poll)
-        ready = self._recorder.is_ready
-        if not ready:
-            print(
-                "[SSVEPExperiment] WARNING: IDUN recorder did not start within "
-                "90 s. Continuing without EEG recording."
-            )
-        elif self._recorder.error:
-            print(
-                f"[SSVEPExperiment] WARNING: IDUN recorder error: "
-                f"{self._recorder.error}. Continuing without EEG."
-            )
-        else:
-            print(
-                f"[SSVEPExperiment] IDUN recording live. "
-                f"ID: {self._recorder.recording_id}"
-            )
-
-    def _measure_refresh_rate_interactive(self, min_seconds: float = 1.0, max_seconds: float = 3.0, target_samples: int = 90) -> float:
-        """Measure refresh rate without blocking the UI.
-
-        PsychoPy's getActualFrameRate() can sit on a blank screen while it
-        looks for a stable estimate. This version flips frames in a loop,
-        updates the status overlay, and keeps Escape / window-close responsive.
+    def run(self) -> None:
         """
+        Run the full experiment:
+          4 rounds × 5 repeats × 5-second SSVEP epochs.
+
+        Between rounds an instruction screen names the target stimulus and
+        waits for SPACE before proceeding.  A short, configurable break is
+        inserted between repeats within a round.
+        """
+        cfg   = self._cfg
+        clock = self._clock
+
+        clock.reset()
+        self._log_event(EventMarker(
+            event_type="EXPERIMENT_START",
+            psychopy_time_s=clock.getTime(),
+            notes=f"rounds={cfg.n_rounds} repeats={cfg.n_repeats_per_round} "
+                  f"epoch_s={cfg.trial_duration_s}",
+        ))
+
+        # brief preparation pause
+        self._show_message("Preparing…")
+        core.wait(cfg.pre_experiment_rest_s)
+
+        labels = cfg.round_labels
+        if len(labels) < cfg.n_rounds:
+            # pad with generic labels if fewer labels than rounds were supplied
+            labels = list(labels) + [
+                f"stimulus {i+1}" for i in range(len(labels), cfg.n_rounds)
+            ]
+
+        # ── round loop ────────────────────────────────────────────────────────
+        for round_idx in range(cfg.n_rounds):
+            if self._check_quit():
+                raise ExperimentAborted("user aborted before round")
+
+            label = labels[round_idx]
+
+            # ── inter-round instruction screen ────────────────────────────────
+            instruction = (
+                f"Round {round_idx + 1} of {cfg.n_rounds}\n\n"
+                f"Please focus on the  {label.upper()}  flickering light.\n\n"
+                f"Keep your gaze fixed on it throughout the round.\n\n"
+                f"There will be five 5 second rounds with short gaps in between\n\n"
+                f"Keep your gaze in the place where the light will be\n\n"
+                f"Press  SPACE  to begin."
+            )
+            self._show_instruction(instruction)
+
+            self._log_event(EventMarker(
+                event_type="ROUND_START",
+                psychopy_time_s=clock.getTime(),
+                round_number=round_idx + 1,
+                round_label=label,
+                notes=f"repeats={cfg.n_repeats_per_round}",
+            ))
+            print(
+                f"\n[SSVEPExperiment] ── Round {round_idx + 1}/{cfg.n_rounds}  "
+                f"target={label!r} ──",
+                flush=True,
+            )
+
+            # ── repeat loop ───────────────────────────────────────────────────
+            for repeat_idx in range(cfg.n_repeats_per_round):
+                if self._check_quit():
+                    raise ExperimentAborted("user aborted during round")
+
+                self._run_epoch(round_idx, repeat_idx, label)
+
+                if repeat_idx < cfg.n_repeats_per_round - 1:
+                    self._run_repeat_break(round_idx, repeat_idx, label)
+
+            self._log_event(EventMarker(
+                event_type="ROUND_END",
+                psychopy_time_s=clock.getTime(),
+                round_number=round_idx + 1,
+                round_label=label,
+            ))
+
+        # ── end ───────────────────────────────────────────────────────────────
+        self._log_event(EventMarker(
+            event_type="EXPERIMENT_END",
+            psychopy_time_s=clock.getTime(),
+            notes=f"total_rounds={cfg.n_rounds}",
+        ))
+
+        self._show_message("Experiment complete.\n\nThank you!")
+        core.wait(3.0)
+
+        self._save_log()
+
+    def _run_epoch(self, round_idx: int, repeat_idx: int, label: str) -> None:
+        """Present all stimuli for one 5-second SSVEP epoch."""
+        cfg   = self._cfg
+        win   = self._win
+        clock = self._clock
+
+        # Reset blinking_stimuli frame counters so stimuli start in phase
+        self._driver.reset_frames()
+
+        epoch_onset = clock.getTime()
+        self._log_event(EventMarker(
+            event_type="EPOCH_START",
+            psychopy_time_s=epoch_onset,
+            round_number=round_idx + 1,
+            repeat_number=repeat_idx + 1,
+            round_label=label,
+        ))
+
+        # ── stimulus presentation loop ────────────────────────────────────────
+        while clock.getTime() - epoch_onset < cfg.trial_duration_s:
+            if self._check_quit():
+                raise ExperimentAborted("user aborted during epoch")
+
+            win.clearBuffer()
+            self._driver.draw()
+            win.flip()
+            self._driver.update()
+
+        epoch_end = clock.getTime()
+        self._log_event(EventMarker(
+            event_type="EPOCH_END",
+            psychopy_time_s=epoch_end,
+            round_number=round_idx + 1,
+            repeat_number=repeat_idx + 1,
+            round_label=label,
+            notes=f"duration_s={epoch_end - epoch_onset:.4f}",
+        ))
+
+        print(
+            f"  Round {round_idx + 1}  Repeat {repeat_idx + 1}/{cfg.n_repeats_per_round}  "
+            f"t={epoch_onset:.3f}s  dur={epoch_end - epoch_onset:.3f}s",
+            flush=True,
+        )
+
+    def _run_repeat_break(self, round_idx: int, repeat_idx: int, label: str) -> None:
+        """Show a short blank rest period between repeats."""
+        cfg = self._cfg
+        clock = self._clock
+        break_start = clock.getTime()
+
+        self._log_event(EventMarker(
+            event_type="REPEAT_BREAK_START",
+            psychopy_time_s=break_start,
+            round_number=round_idx + 1,
+            repeat_number=repeat_idx + 1,
+            round_label=label,
+            notes=f"break_s={cfg.repeat_break_s:.3f}",
+        ))
+
+        core.wait(cfg.repeat_break_s)
+
+        break_end = clock.getTime()
+        self._log_event(EventMarker(
+            event_type="REPEAT_BREAK_END",
+            psychopy_time_s=break_end,
+            round_number=round_idx + 1,
+            repeat_number=repeat_idx + 1,
+            round_label=label,
+            notes=f"duration_s={break_end - break_start:.4f}",
+        ))
+
+    # ── teardown ──────────────────────────────────────────────────────────────
+
+    def teardown(self) -> None:
+        """Close the PsychoPy window."""
+        if self._win:
+            try:
+                self._win.close()
+            except Exception as exc:
+                print(f"[SSVEPExperiment] Window close error: {exc}", flush=True)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _show_message(self, text: str) -> None:
+        """Display a centred text message for one frame."""
+        msg = visual.TextStim(
+            self._win,
+            text=text,
+            color=(1, 1, 1),
+            height=30,
+            units="pix",
+            wrapWidth=self._win.size[0] * 0.8,
+        )
+        self._win.clearBuffer()
+        msg.draw()
+        self._win.flip()
+
+    def _show_instruction(self, text: str) -> None:
+        """
+        Display an instruction screen and wait for the participant to press
+        SPACE (or Escape/Q to abort).  The screen remains visible until a key
+        is pressed.
+        """
+        msg = visual.TextStim(
+            self._win,
+            text=text,
+            color=(1, 1, 1),
+            height=32,
+            units="pix",
+            wrapWidth=self._win.size[0] * 0.75,
+        )
+        while True:
+            if self._abort_requested():
+                raise ExperimentAborted("user aborted on instruction screen")
+
+            self._win.clearBuffer()
+            msg.draw()
+            self._win.flip()
+
+            keys = event.getKeys(keyList=["space", "escape", "q"])
+            if "space" in keys:
+                break
+            if "escape" in keys or "q" in keys:
+                raise ExperimentAborted("user aborted on instruction screen")
+
+    def _measure_refresh_rate_interactive(
+        self,
+        min_seconds: float = 1.0,
+        max_seconds: float = 3.0,
+        target_samples: int = 90,
+    ) -> float:
+        """Measure refresh rate without blocking the UI."""
         import statistics
-        import time as _time
 
         samples: list[float] = []
         last_flip = None
-        start = _time.perf_counter()
-        warmup = 10
+        start     = time.perf_counter()
+        warmup    = 10
 
         while True:
-            elapsed = _time.perf_counter() - start
+            elapsed = time.perf_counter() - start
             if self._abort_requested():
                 raise ExperimentAborted("user aborted during refresh-rate measurement")
 
@@ -1006,11 +717,11 @@ class SSVEPExperiment:
                 self._status_stim.draw()
             self._win.flip()
 
-            flip_time = _time.perf_counter()
+            flip_time = time.perf_counter()
             if last_flip is not None and warmup <= 0:
                 samples.append(flip_time - last_flip)
-            last_flip = flip_time
-            warmup -= 1
+            last_flip  = flip_time
+            warmup    -= 1
 
             if elapsed >= min_seconds and len(samples) >= target_samples:
                 break
@@ -1027,13 +738,13 @@ class SSVEPExperiment:
 
     def _build_stimuli(self, W: int, H: int) -> list:
         """Construct the stimulus list using blinking_stimuli.QuickLayout."""
-        cfg = self._cfg
+        cfg    = self._cfg
         layout = cfg.layout.lower()
 
-        # blinking_stimuli image loading requires real files.
-        # If the configured image_paths don't exist, generate placeholders.
         try:
-            image_paths = self._resolve_image_paths(cfg.image_paths, len(cfg.flicker_frequencies))
+            image_paths = self._resolve_image_paths(
+                cfg.image_paths, len(cfg.flicker_frequencies)
+            )
         except BaseException as exc:
             import traceback
             print(f"[SSVEPExperiment] ERROR resolving image paths: {exc}", flush=True)
@@ -1057,42 +768,34 @@ class SSVEPExperiment:
             elif layout == "circle":
                 print("[SSVEPExperiment] Creating circle layout via QuickLayout.circle", flush=True)
                 return QuickLayout.circle(
-                    image_paths = image_paths,
+                    image_paths  = image_paths,
                     W=W, H=H,
-                    n           = cfg.layout_circle_n,
-                    radius      = cfg.layout_circle_radius,
-                    size        = cfg.stimulus_size,
-                    target_freq = cfg.flicker_frequencies,
+                    n            = cfg.layout_circle_n,
+                    radius       = cfg.layout_circle_radius,
+                    size         = cfg.stimulus_size,
+                    target_freq  = cfg.flicker_frequencies,
                     flicker_mode = cfg.flicker_mode,
                     flicker_type = cfg.flicker_type,
                     color_mode   = cfg.color_mode,
                 )
             elif layout == "checkerboard":
-                print("[SSVEPExperiment] Creating checkerboard layout via QuickLayout.checkerboard", flush=True)
-
-                rows = cfg.layout_rows
-                cols = cfg.layout_cols
+                print("[SSVEPExperiment] Creating checkerboard layout", flush=True)
+                rows   = cfg.layout_rows
+                cols   = cfg.layout_cols
                 n_cells = rows * cols
 
-                # Always use resolved image paths
                 if len(image_paths) < 2:
                     raise ValueError(
                         "Checkerboard layout requires at least 2 image paths (A and B)"
                     )
-
                 img_a = image_paths[0]
                 img_b = image_paths[1]
-
                 freqs = cfg.flicker_frequencies
 
-                # Case 1: exactly two frequencies (preferred)
                 if isinstance(freqs, (list, tuple)) and len(freqs) == 2:
                     tf_a, tf_b = freqs
-
-                # Case 2: full grid frequencies
                 elif isinstance(freqs, (list, tuple)) and len(freqs) == n_cells:
-                    tf_a = []
-                    tf_b = []
+                    tf_a, tf_b = [], []
                     for i in range(n_cells):
                         r = i // cols
                         c = i % cols
@@ -1100,53 +803,39 @@ class SSVEPExperiment:
                             tf_a.append(freqs[i])
                         else:
                             tf_b.append(freqs[i])
-
-                # Case 3: single scalar frequency
-                elif isinstance(freqs, (int, float)):
-                    tf_a = tf_b = freqs
-
                 else:
                     raise ValueError(
-                        f"Invalid flicker_frequencies for checkerboard: {freqs}\n"
-                        f"Expected: [A, B] or full list of {n_cells}"
+                        f"checkerboard: flicker_frequencies must have 2 values or "
+                        f"{n_cells} (one per cell); got {len(freqs)}."
                     )
 
                 return QuickLayout.checkerboard(
-                    image_paths_a = img_a,
-                    image_paths_b = img_b,
-                    W = W,
-                    H = H,
-                    rows = rows,
-                    cols = cols,
-                    size = cfg.stimulus_size,
+                    image_path_a = img_a,
+                    image_path_b = img_b,
+                    W=W, H=H,
+                    rows         = rows,
+                    cols         = cols,
+                    size         = cfg.stimulus_size,
                     target_freq_a = tf_a,
                     target_freq_b = tf_b,
                     flicker_mode = cfg.flicker_mode,
                     flicker_type = cfg.flicker_type,
-                    color_mode = cfg.color_mode,
+                    color_mode   = cfg.color_mode,
                 )
             else:
                 raise ValueError(
-                    f"Unsupported layout '{cfg.layout}'. Choose 'grid', 'circle' or 'checkerboard'."
+                    f"Unknown layout '{cfg.layout}'. "
+                    "Choose 'grid', 'circle', or 'checkerboard'."
                 )
-        except BaseException as exc:
+        except Exception as exc:
             import traceback
-            print(f"[SSVEPExperiment] ERROR building stimuli ({layout}): {exc}", flush=True)
+            print(f"[SSVEPExperiment] ERROR building stimuli: {exc}", flush=True)
             traceback.print_exc()
             raise
 
     @staticmethod
     def _resolve_image_paths(paths: list, n_stimuli: int) -> list:
-        """
-        Return a list of valid image file paths of length n_stimuli.
-
-        If a path doesn't exist, generate a coloured placeholder PNG using
-        blinking_stimuli's _make_placeholder helper (requires pygame.font.init).
-        """
-        import pygame
-        pygame.font.init()
-
-        # Delayed import to avoid circular dependency issues
+        """Return n_stimuli image paths, generating colour placeholders as needed."""
         from blinking_stimuli import _make_placeholder
 
         PLACEHOLDER_COLOURS = [
@@ -1163,149 +852,17 @@ class SSVEPExperiment:
                 resolved.append(_make_placeholder(colour, f"S{i+1}"))
         return resolved
 
-    # ── main trial loop ───────────────────────────────────────────────────────
-
-    def run(self) -> None:
-        """Run the full trial sequence."""
-        cfg   = self._cfg
-        win   = self._win
-        clock = self._clock
-
-        # Reset the experiment clock at the moment we consider "t = 0"
-        clock.reset()
-
-        self._log_event(EventMarker(
-            event_type="EXPERIMENT_START",
-            psychopy_time_s=clock.getTime(),
-        ))
-
-        # ── pre-experiment rest ───────────────────────────────────────────────
-        self._show_message("Preparing…")
-        core.wait(cfg.pre_experiment_rest_s)
-        self._show_message("")
-
-        # ── trial loop ────────────────────────────────────────────────────────
-        for trial_idx in range(cfg.n_trials):
-            if self._check_quit():
-                raise ExperimentAborted("user aborted during run")
-
-            self._run_trial(trial_idx)
-            self._run_isi(trial_idx)
-
-        # ── end ───────────────────────────────────────────────────────────────
-        self._log_event(EventMarker(
-            event_type="EXPERIMENT_END",
-            psychopy_time_s=clock.getTime(),
-            notes=f"total_trials={cfg.n_trials}",
-        ))
-
-        self._show_message("Experiment complete.\nThank you.")
-        core.wait(2.0)
-
-        self._save_log()
-        self._save_eeg_log()
-
-    def _run_trial(self, trial_idx: int) -> None:
-        """Present all stimuli for one trial epoch."""
-        cfg   = self._cfg
-        win   = self._win
-        clock = self._clock
-
-        # Reset blinking_stimuli frame counters so all stimuli start in phase
-        self._driver.reset_frames()
-
-        trial_onset = clock.getTime()
-        self._log_event(EventMarker(
-            event_type="TRIAL_START",
-            psychopy_time_s=trial_onset,
-            trial_number=trial_idx + 1,
-            notes=f"all_{len(self._stimuli)}_stimuli",
-        ))
-
-        # Push marker to IDUN background thread for recording annotation
-        if self._recorder:
-            self._recorder.push_marker(EventMarker(
-                event_type="TRIAL_START",
-                psychopy_time_s=trial_onset,
-                trial_number=trial_idx + 1,
-                idun_recording_id=self._recorder.recording_id or "",
-            ))
-
-        # ── stimulus presentation loop ────────────────────────────────────────
-        while clock.getTime() - trial_onset < cfg.trial_duration_s:
-            if self._check_quit():
-                raise ExperimentAborted("user aborted during trial")
-
-            win.clearBuffer()
-            self._driver.draw()
-            win.flip()
-            self._driver.update()
-
-        trial_end = clock.getTime()
-        self._log_event(EventMarker(
-            event_type="TRIAL_END",
-            psychopy_time_s=trial_end,
-            trial_number=trial_idx + 1,
-            notes=f"duration_s={trial_end - trial_onset:.4f}",
-        ))
-
-        print(
-            f"  Trial {trial_idx + 1:>3}/{cfg.n_trials}  "
-            f"t={trial_onset:.3f}s  "
-            f"dur={trial_end - trial_onset:.3f}s"
-        )
-
-    def _run_isi(self, trial_idx: int) -> None:
-        """Blank inter-stimulus interval."""
-        cfg   = self._cfg
-        win   = self._win
-        clock = self._clock
-
-        isi_onset = clock.getTime()
-        self._log_event(EventMarker(
-            event_type="ISI_START",
-            psychopy_time_s=isi_onset,
-            trial_number=trial_idx + 1,
-        ))
-
-        while clock.getTime() - isi_onset < cfg.isi_duration_s:
-            if self._check_quit():
-                raise ExperimentAborted("user aborted during ISI")
-            win.clearBuffer()
-            win.flip()
-
-    # ── teardown ──────────────────────────────────────────────────────────────
-
-    def teardown(self) -> None:
-        """Stop the IDUN recorder and close the PsychoPy window."""
-        if self._recorder:
-            print("[SSVEPExperiment] Stopping IDUN recorder…")
-            try:
-                self._recorder.stop()
-            except Exception as exc:
-                print(f"[SSVEPExperiment] Recorder stop error: {exc}", flush=True)
-
-        if self._win:
-            try:
-                self._win.close()
-            except Exception as exc:
-                print(f"[SSVEPExperiment] Window close error: {exc}", flush=True)
-
-    # ── helpers ───────────────────────────────────────────────────────────────
-
     def _log_event(self, marker: EventMarker) -> None:
-        """Append a marker to the in-memory event log."""
-        if self._recorder and self._recorder.recording_id:
-            marker.idun_recording_id = self._recorder.recording_id
         self._event_log.append(marker)
 
     def _save_log(self) -> None:
         """Write the event log to a CSV file."""
-        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fn  = self._cfg.log_filename.replace("{datetime}", ts)
-        out = Path(self._cfg.output_dir) / fn
-
-        fields = list(asdict(self._event_log[0]).keys()) if self._event_log else []
+        if not self._event_log:
+            return
+        ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fn     = self._cfg.log_filename.replace("{datetime}", ts)
+        out    = Path(self._cfg.output_dir) / fn
+        fields = list(asdict(self._event_log[0]).keys())
         try:
             with open(out, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fields)
@@ -1316,127 +873,21 @@ class SSVEPExperiment:
         except Exception as exc:
             print(f"[SSVEPExperiment] Failed to save log: {exc}")
 
-    def _save_eeg_log(self) -> None:
-        """
-        Write the live EEG buffer (raw + filtered) to a CSV file.
-
-        Each BLE packet is expanded to one row per sample.  Timestamps are
-        linearly interpolated across the packet so every sample gets its own
-        estimated wall-clock time.
-
-        Columns
-        ───────
-          sample_index      — global sample counter (0-based)
-          packet_index      — which BLE packet this sample came from
-          wall_time_s       — estimated wall-clock time (seconds, time.time() epoch)
-          raw_eeg           — raw EEG value (µV)
-          filtered_eeg      — filtered EEG value (µV), empty if not streamed
-          idun_recording_id — IDUN recording ID for cloud alignment
-        """
-        if not self._cfg.eeg_log_filename:
-            return   # disabled by user
-
-        recorder = self._recorder
-        if recorder is None or not hasattr(recorder, "get_eeg_buffer"):
-            print("[SSVEPExperiment] EEG log: no recorder buffer available — skipping.")
-            return
-
-        buffer = recorder.get_eeg_buffer()
-        if not buffer:
-            print("[SSVEPExperiment] EEG log: buffer is empty — no live data was collected.")
-            return
-
-        recording_id = getattr(recorder, "recording_id", "") or ""
-        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fn  = self._cfg.eeg_log_filename.replace("{datetime}", ts)
-        out = Path(self._cfg.output_dir) / fn
-
-        fields = [
-            "sample_index",
-            "packet_index",
-            "wall_time_s",
-            "raw_eeg",
-            "filtered_eeg",
-            "idun_recording_id",
-        ]
-
-        try:
-            with open(out, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fields)
-                writer.writeheader()
-
-                sample_index = 0
-                for pkt_idx, packet in enumerate(buffer):
-                    pkt_time     = packet["packet_wall_time"]
-                    raw_samples  = packet["raw_eeg"]
-                    filt_samples = packet["filtered_eeg"]
-
-                    # Use whichever list is longer to determine row count.
-                    n = max(len(raw_samples), len(filt_samples))
-                    if n == 0:
-                        continue
-
-                    # Assign each sample an interpolated timestamp.
-                    # We use the packet arrival time as the timestamp of the
-                    # *last* sample; earlier samples are spaced 1/n apart.
-                    # (A future improvement could use the next packet's time
-                    # to derive a more accurate inter-sample interval.)
-                    for i in range(n):
-                        raw_val  = raw_samples[i]  if i < len(raw_samples)  else ""
-                        filt_val = filt_samples[i] if i < len(filt_samples) else ""
-
-                        # Fractional offset: sample 0 is oldest, sample n-1 is newest
-                        # We don't know the exact inter-sample interval so we leave
-                        # this as pkt_time for all samples in the packet; analysts
-                        # can refine using the known sample rate.
-                        writer.writerow({
-                            "sample_index":      sample_index,
-                            "packet_index":      pkt_idx,
-                            "wall_time_s":       pkt_time,
-                            "raw_eeg":           raw_val,
-                            "filtered_eeg":      filt_val,
-                            "idun_recording_id": recording_id,
-                        })
-                        sample_index += 1
-
-            total_pkts    = len(buffer)
-            total_samples = sample_index
-            print(
-                f"[SSVEPExperiment] EEG log saved → {out}  "
-                f"({total_pkts} packets, {total_samples} samples)"
-            )
-        except Exception as exc:
-            print(f"[SSVEPExperiment] Failed to save EEG log: {exc}")
-
-    def _show_message(self, text: str) -> None:
-        """Display a centred text message for one frame."""
-        msg = visual.TextStim(
-            self._win, text=text, color=(1, 1, 1), height=30, units="pix",
-            wrapWidth=self._win.size[0] * 0.8
-        )
-        self._win.clearBuffer()
-        msg.draw()
-        self._win.flip()
-
     def _update_status(self, lines: list) -> None:
-        """Update the top-left monospace status display with given lines."""
         try:
             if not hasattr(self, "_status_stim") or self._status_stim is None:
                 return
             self._status_stim.text = "\n".join(lines)
         except Exception:
-            # Do not raise from a status update; it's purely cosmetic.
             pass
 
     def _abort_requested(self) -> bool:
-        """Return True if the user pressed Escape/Q or closed the window."""
         try:
             keys = event.getKeys(keyList=["escape", "q"])
             if keys:
                 return True
         except Exception:
             pass
-
         try:
             if self._win is not None and getattr(self._win, "winHandle", None) is not None:
                 self._win.winHandle.dispatch_events()
@@ -1447,7 +898,6 @@ class SSVEPExperiment:
         return False
 
     def _check_quit(self) -> bool:
-        """Return True if the user requested to abort the experiment."""
         return self._abort_requested()
 
     @staticmethod
@@ -1464,50 +914,6 @@ class SSVEPExperiment:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Post-session data utilities
-# ──────────────────────────────────────────────────────────────────────────────
-
-def download_recording(api_token: str, recording_id: str,
-                       file_types: list = None) -> None:
-    """
-    Standalone helper — download EEG (and optionally IMU / impedance) data
-    for a completed recording without running the full experiment.
-
-    Usage
-    ─────
-      from ssvep_experiment import download_recording
-      download_recording("idun_xxx", "recording-id-here")
-    """
-    if not IDUN_AVAILABLE:
-        print("[download_recording] idun-guardian-sdk is not installed.")
-        return
-
-    if file_types is None:
-        file_types = [FileTypes.EEG]
-
-    client = GuardianClient(api_token=api_token)
-    for ft in file_types:
-        print(f"[download_recording] Downloading {ft.name}…")
-        try:
-            client.download_file(recording_id=recording_id, file_type=ft)
-            print(f"[download_recording] {ft.name} saved.")
-        except Exception as exc:
-            print(f"[download_recording] {ft.name} failed: {exc}")
-
-
-def list_recordings(api_token: str, limit: int = 10) -> list:
-    """Return a list of the most recent completed recordings."""
-    if not IDUN_AVAILABLE:
-        print("[list_recordings] idun-guardian-sdk is not installed.")
-        return []
-    client = GuardianClient(api_token=api_token)
-    recordings = client.get_recordings(status="COMPLETED", limit=limit)
-    for i, r in enumerate(recordings):
-        print(f"  {i}: {r}")
-    return recordings
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1516,45 +922,51 @@ if __name__ == "__main__":
     # ── CONFIGURE YOUR EXPERIMENT HERE ───────────────────────────────────────
     config = ExperimentConfig(
         # ── Display ────────────────────────────────────────────────────────
-        monitor_name     = "testMonitor",   # PsychoPy monitor profile
-        screen_index     = 0,
-        fullscreen       = True,
-        target_fps       = 75,              # ← set to your monitor's refresh rate
+        monitor_name  = "testMonitor",
+        screen_index  = 0,
+        fullscreen    = True,
+        target_fps    = 75,          # ← set to your monitor's refresh rate
 
         # ── Stimuli ────────────────────────────────────────────────────────
-        # Replace "placeholder.png" with your actual image path.
-        # A colour-block placeholder will be generated automatically if the
-        # file does not exist, so the experiment will still run for testing.
-        image_paths      = ["Images/WhiteSquare1.png", "Images/BlackSquare1.png", "Images/WhiteSquare1.png", "Images/BlackSquare1.png",
-                            "Images/BlackSquare1.png", "Images/WhiteSquare1.png", "Images/BlackSquare1.png", "Images/WhiteSquare1.png"],
-        stimulus_size    = (150, 150),
-        flicker_frequencies = [6.0, 0.0, 8.0, 0.0,
-                               0.0, 11.0, 0.0, 15.0],
-        layout           = "grid",          # "grid", "checkerboard" or "circle"
-        layout_rows      = 2,
-        layout_cols      = 4,
+        # Images cycle across the 8 grid positions (white/black alternating).
+        image_paths = [
+            "Images/WhiteSquare1.png", "Images/BlackSquare1.png",
+            "Images/WhiteSquare1.png", "Images/BlackSquare1.png",
+            "Images/BlackSquare1.png", "Images/WhiteSquare1.png",
+            "Images/BlackSquare1.png", "Images/WhiteSquare1.png",
+        ],
+        stimulus_size       = (150, 150),
+        # Active stimuli (non-zero frequency) sit at the four corners of the
+        # 2×4 grid:  top-left=6 Hz, top-right=8 Hz,
+        #            bottom-left=11 Hz, bottom-right=15 Hz.
+        # Zero-frequency entries are static (no flicker).
+        flicker_frequencies = [
+            6.0,  0.0,  8.0,  0.0,   # row 0:  TL  --  TR  --
+            0.0, 11.0,  0.0, 15.0,   # row 1:  --  BL  --  BR
+        ],
+        layout      = "grid",
+        layout_rows = 2,
+        layout_cols = 4,
 
         # ── Timing ─────────────────────────────────────────────────────────
-        n_trials         = 3,
-        trial_duration_s = 4.0,
-        isi_duration_s   = 1.0,
+        n_rounds           = 4,   # one round per target location
+        n_repeats_per_round = 5,  # epochs per round
+        trial_duration_s   = 5.0, # seconds per epoch
+        repeat_break_s     = 0.75, # short pause between repeats
+        pre_experiment_rest_s = 2.0,
 
-        # ── IDUN Guardian ──────────────────────────────────────────────────
-        # Leave idun_api_token blank to use the IDUN_API_TOKEN env variable.
-        # Leave idun_device_address blank to auto-search for the earbud.
-        enable_idun              = False,
-        idun_api_token           = "idun_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJkNjM2YmRlZC1hMzc1LTRhZDUtYjM0NC1jYjBkNzllZmVjYmEiLCJ1aWQiOiIxZjYzZTFjNy03YjAwLTQ3ODUtODUwYS1jMDc0OTI3YzE4OGUiLCJkaWQiOiIwMC0wMi01Qi0wMC1GRi0wRiIsImlhdCI6MTc3NTc0MDgwMy45MDU4OTR9._p2y7JgEOG8AMKBTimomYm9HrLJzjlVup2rHMWIhylc",
-        idun_device_address      = "",
-        idun_recording_duration_s = 3600,
-        idun_stream_live_eeg     = True,
-        idun_impedance_check     = True,
-        idun_impedance_duration_s = 10,
-        idun_download_after      = True,
+        # ── Round labels ───────────────────────────────────────────────────
+        # Must match the order of your active stimuli (left→right, top→bottom).
+        round_labels = [
+            "top left",
+            "top right",
+            "bottom left",
+            "bottom right",
+        ],
 
         # ── Output ─────────────────────────────────────────────────────────
-        output_dir       = ".",
-        log_filename     = "ssvep_events_{datetime}.csv",
-        eeg_log_filename = "ssvep_eeg_{datetime}.csv",
+        output_dir   = ".",
+        log_filename = "ssvep_events_{datetime}.csv",
     )
     # ─────────────────────────────────────────────────────────────────────────
 
