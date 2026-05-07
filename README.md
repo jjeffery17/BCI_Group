@@ -56,6 +56,11 @@ This module provides the stimulus classes and helper functions used by the SSVEP
 
 ## Setup
 
+Python MUST be installed as version 3.8 or 3.10. Check with:
+```bash
+python --version
+```
+
 Install the required Python packages:
 
 ```bash
@@ -80,7 +85,7 @@ If you are using the current default experiment configuration, the image paths i
 python idun_viewer.py
 ```
 
-3. Wait until the EEG signal looks stable and the viewer has finished its initial connection and impedance checks.
+3. Wait until the EEG signal looks stable and the viewer has finished its initial connection and impedance checks. This may take a while (around 2-3 mins I have found when testing). It can be useful to test the signal is working correctly by clenching your jaw and looking out for spikes in noise. There is a roughly 1 second delay between the actual EEG and the graph, I'm not sure about delays in the CSV however.
 4. In a second terminal, run:
 
 ```bash

@@ -13,10 +13,9 @@ Experiment structure
 
   Each round:
     - Instruction screen: which light to focus on (press SPACE to start)
-    - 5 continuous 5-second SSVEP epochs
-    - A short, defined break between repeats
+    - 5 continuous 5-second SSVEP epochs (no gap between repeats)
 
-  Total: 4 rounds × 5 repeats × 5 s of stimulus time, plus short breaks.
+  Total: 4 rounds × 5 repeats × 5 s = 100 s of stimulus time.
 
 Typical usage
 ─────────────
@@ -127,9 +126,9 @@ class ExperimentConfig:
     # ── Timing ────────────────────────────────────────────────────────────────
     # Structure: 4 rounds × n_repeats_per_round × trial_duration_s
     n_rounds: int           = 4     # one round per target location
-    n_repeats_per_round: int = 5    # SSVEP epochs within each round
+    n_repeats_per_round: int = 5    # continuous SSVEP epochs within each round
     trial_duration_s: float = 5.0   # seconds per SSVEP epoch
-    repeat_break_s: float   = 0.75  # short pause between repeats
+    repeat_break_s: float = 0.75   # blank pause between repeats
     pre_experiment_rest_s: float = 2.0
 
     # ── Round labels ─────────────────────────────────────────────────────────
@@ -318,9 +317,9 @@ class SSVEPExperiment:
       For each of 4 rounds:
         1. Instruction screen naming the target (e.g. "top left").
            Participant presses SPACE to begin.
-        2. 5 consecutive 5-second SSVEP epochs with a short break between repeats.
+        2. 5 consecutive 5-second SSVEP epochs with NO gap between them.
 
-      Total stimulus time: 4 × 5 × 5 s, plus the repeat breaks.
+      Total stimulus time: 4 × 5 × 5 s = 100 s.
 
     Usage
     ─────
@@ -471,8 +470,8 @@ class SSVEPExperiment:
           4 rounds × 5 repeats × 5-second SSVEP epochs.
 
         Between rounds an instruction screen names the target stimulus and
-        waits for SPACE before proceeding.  A short, configurable break is
-        inserted between repeats within a round.
+        waits for SPACE before proceeding.  No gap is inserted between the
+        5 repeats within a round.
         """
         cfg   = self._cfg
         clock = self._clock
@@ -508,8 +507,6 @@ class SSVEPExperiment:
                 f"Round {round_idx + 1} of {cfg.n_rounds}\n\n"
                 f"Please focus on the  {label.upper()}  flickering light.\n\n"
                 f"Keep your gaze fixed on it throughout the round.\n\n"
-                f"There will be five 5 second rounds with short gaps in between\n\n"
-                f"Keep your gaze in the place where the light will be\n\n"
                 f"Press  SPACE  to begin."
             )
             self._show_instruction(instruction)
@@ -534,6 +531,7 @@ class SSVEPExperiment:
 
                 self._run_epoch(round_idx, repeat_idx, label)
 
+                # Blank/off break between repeats only
                 if repeat_idx < cfg.n_repeats_per_round - 1:
                     self._run_repeat_break(round_idx, repeat_idx, label)
 
@@ -601,9 +599,11 @@ class SSVEPExperiment:
         )
 
     def _run_repeat_break(self, round_idx: int, repeat_idx: int, label: str) -> None:
-        """Show a short blank rest period between repeats."""
+        """Turn all stimuli off during the inter-repeat break."""
         cfg = self._cfg
+        win = self._win
         clock = self._clock
+
         break_start = clock.getTime()
 
         self._log_event(EventMarker(
@@ -612,9 +612,18 @@ class SSVEPExperiment:
             round_number=round_idx + 1,
             repeat_number=repeat_idx + 1,
             round_label=label,
-            notes=f"break_s={cfg.repeat_break_s:.3f}",
         ))
 
+        # Explicitly disable all stimuli
+        for stim in self._driver._stimuli:
+            try:
+                stim.setAutoDraw(False)
+            except Exception:
+                pass
+
+        # Blank screen during break
+        win.clearBuffer()
+        win.flip()
         core.wait(cfg.repeat_break_s)
 
         break_end = clock.getTime()
@@ -950,9 +959,8 @@ if __name__ == "__main__":
 
         # ── Timing ─────────────────────────────────────────────────────────
         n_rounds           = 4,   # one round per target location
-        n_repeats_per_round = 5,  # epochs per round
+        n_repeats_per_round = 5,  # 5 continuous epochs per round
         trial_duration_s   = 5.0, # seconds per epoch
-        repeat_break_s     = 0.75, # short pause between repeats
         pre_experiment_rest_s = 2.0,
 
         # ── Round labels ───────────────────────────────────────────────────

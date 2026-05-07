@@ -38,7 +38,7 @@ csv_writer = None
 # ─────────────────────────────────────────────
 API_TOKEN     = os.environ.get("IDUN_API_TOKEN", "idun_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJkNjM2YmRlZC1hMzc1LTRhZDUtYjM0NC1jYjBkNzllZmVjYmEiLCJ1aWQiOiIxZjYzZTFjNy03YjAwLTQ3ODUtODUwYS1jMDc0OTI3YzE4OGUiLCJkaWQiOiIwMC0wMi01Qi0wMC1GRi0wRiIsImlhdCI6MTc3NTc0MDgwMy45MDU4OTR9._p2y7JgEOG8AMKBTimomYm9HrLJzjlVup2rHMWIhylc")
 DEVICE_ADDRESS = ""          # leave blank to auto-search for IGEB
-RECORDING_TIMER = 300        # seconds (5 min default; Ctrl+C to stop early)
+RECORDING_TIMER = 900        # seconds (15 min default; Ctrl+C to stop early)
 MAINS_60HZ    = False        # True for US/Canada 60 Hz mains
 WINDOW_SEC    = 10           # seconds of history shown in the live graph
 EEG_SAMPLE_RATE = 250        # Hz – Guardian sample rate
