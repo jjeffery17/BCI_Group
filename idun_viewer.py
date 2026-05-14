@@ -36,7 +36,7 @@ csv_writer = None
 # ─────────────────────────────────────────────
 #  CONFIG  –  fill in or set env var
 # ─────────────────────────────────────────────
-API_TOKEN     = os.environ.get("IDUN_API_TOKEN", "idun_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJkNjM2YmRlZC1hMzc1LTRhZDUtYjM0NC1jYjBkNzllZmVjYmEiLCJ1aWQiOiIxZjYzZTFjNy03YjAwLTQ3ODUtODUwYS1jMDc0OTI3YzE4OGUiLCJkaWQiOiIwMC0wMi01Qi0wMC1GRi0wRiIsImlhdCI6MTc3NTc0MDgwMy45MDU4OTR9._p2y7JgEOG8AMKBTimomYm9HrLJzjlVup2rHMWIhylc")
+API_TOKEN     = os.environ.get("IDUN_API_TOKEN", "INSERT_API_TOKEN_HERE")
 DEVICE_ADDRESS = ""          # leave blank to auto-search for IGEB
 RECORDING_TIMER = 900        # seconds (15 min default; Ctrl+C to stop early)
 MAINS_60HZ    = False        # True for US/Canada 60 Hz mains
